@@ -47,6 +47,9 @@ type PrefixListAddressFamilyManager struct {
 
 	// prefixListNamesToExistingPrefixLists maps prefix list names to EC2 prefix list objects.
 	prefixListNamesToExistingPrefixLists map[string]*ec2.ManagedPrefixList
+
+	// prefixListIds is the final set of prefix lists encompassing this filter.
+	prefixListIDs []string
 }
 
 // NewPrefixListAddressFamilyManager creates a new PrefixListAddressFamilyManager object with the specified parameters.
@@ -217,6 +220,8 @@ func (plafm *PrefixListAddressFamilyManager) updateManagedPrefixLists() []Prefix
 	return results
 }
 
+// managePrefixListBlock creates or upates a prefix list corresponding to a block of prefixes. This block may be a subset of the
+// full set of prefixes returned by the filters -- it's always less than or equal to the group size.
 func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) []PrefixListManagementOp {
 	if existingPrefixList == nil {
 		// No existing prefix list. Create one.
@@ -231,6 +236,7 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 		} else {
 			result.Operation = OpCreatePrefixList
 			result.NewPrefixListID = aws.StringValue(prefixList.PrefixListId)
+			plafm.prefixListIDs = append(plafm.prefixListIDs, result.NewPrefixListID)
 		}
 
 		return []PrefixListManagementOp{result}
@@ -279,6 +285,7 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 			return true
 		})
 
+		// Failed to get the existing entries.
 		if err != nil {
 			log.Printf("Failed to get entries for prefix list %s (%s): %v", existingPrefixListID, prefixListName, err)
 			result := PrefixListManagementOp{
@@ -286,13 +293,21 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 				ExistingPrefixListID: existingPrefixListID, Error: err,
 			}
 
+			// Since we're not able to create or update a prefix list for this block, assume that this is ok for now. Otherwise,
+			// the prefix list may fall out of SSM and other brokenness may happen.
+			plafm.prefixListIDs = append(plafm.prefixListIDs, existingPrefixListID)
+
 			return []PrefixListManagementOp{result}
 		}
 	}
 
 	if replacementNeeded {
+		// replacePrefixList will set the new id in plafm.prefixListIDs.
 		return plafm.replacePrefixList(groupID, prefixListName, existingPrefixList, prefixBlock)
 	}
+
+	// We know that this prefix list will be retained at this point. Add it to the prefix lists that are considered final.
+	plafm.prefixListIDs = append(plafm.prefixListIDs, existingPrefixListID)
 
 	// Generate the entries to add to the CIDR block.
 	for prefix, seen := range seenPrefixes {
@@ -326,6 +341,7 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 			ExistingPrefixListID: existingPrefixListID, Error: err,
 		}}
 	}
+
 	return []PrefixListManagementOp{{
 		PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpUpdatePrefixListEntries,
 		ExistingPrefixListID: existingPrefixListID,
@@ -393,26 +409,33 @@ func (plafm *PrefixListAddressFamilyManager) replacePrefixList(groupID uint, pre
 		return true
 	})
 
+	// We couldn't figure out who is referencing this list. Note the error and continue.
 	if err != nil {
 		log.Printf("Can't replace prefix list %s: GetManagedPrefixListAssociations failed: %v", existingPrefixListID, err)
 		results = append(results, PrefixListManagementOp{
 			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListQueryFailedError, ExistingPrefixListID: existingPrefixListID, Error: err,
 		})
-
-		return results
 	}
 
 	// Create a new prefix list first.
 	newPrefixList, err := plafm.createPrefixList(groupID, prefixListName, prefixBlock)
 	if err != nil {
+		// This isn't a good situation. For now, mark the existing as final for this block so we don't drop rules.
+		plafm.prefixListIDs = append(plafm.prefixListIDs, existingPrefixListID)
+
 		results = append(results, PrefixListManagementOp{
 			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListCreateFailedError, Error: err,
 		})
+
+		// Don't attempt to replace this.
+		return results
 	}
 
+	// We were successful in creating the new prefix list. Add it to the list of final prefix lists.
 	newPrefixListID := aws.StringValue(newPrefixList.PrefixListId)
+	plafm.prefixListIDs = append(plafm.prefixListIDs, newPrefixListID)
 
-	// Wait until the prefix list is ready
+	// Wait until the prefix list is ready before attempting to inject it into security groups.
 outer:
 	for {
 		state := aws.StringValue(newPrefixList.State)
@@ -501,7 +524,7 @@ outer:
 		})
 	}
 
-	// Delete the old prefix list
+	// Delete the old prefix list.
 	_, err = plafm.ec2.DeleteManagedPrefixList(&ec2.DeleteManagedPrefixListInput{DryRun: aws.Bool(false), PrefixListId: aws.String(existingPrefixListID)})
 	if err != nil {
 		log.Printf("Failed to delete old prefix list %s (%s): %v", existingPrefixListID, prefixListName, err)
