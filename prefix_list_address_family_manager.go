@@ -18,7 +18,7 @@ type PrefixListAddressFamilyManager struct {
 	// partition is the AWS partition we're operating in.
 	partition string
 
-	// accountID is the 12-digit account identifier for this account
+	// accountID is the 12-digit account identifier for this account.
 	accountID string
 
 	// ec2 is a handle to the EC2 service.
@@ -27,25 +27,25 @@ type PrefixListAddressFamilyManager struct {
 	// addressFamily is the IP protocol, either "IPv4" or "IPv6"
 	addressFamily string
 
-	// groupSize is the size of the groups to create
+	// groupSize is the size of the groups to create.
 	groupSize uint
 
-	// tags is a map of the tags that should be applied to the resulting prefix lists
+	// tags is a map of the tags that should be applied to the resulting prefix lists.
 	tags TagMap
 
-	// allPrefixes is the parsed ip-ranges.json data, unprocessed
+	// allPrefixes is the parsed ip-ranges.json data, unprocessed.
 	allPrefixes []IPPrefix
 
 	// keptPrefixes contains the CIDR blocks of the IPv4 prefixes we need (after filtering and aggregation).
 	keptPrefixes []string
 
-	// nGroups indicates the number of groups we need
+	// nGroups indicates the number of groups we need.
 	nGroups uint
 
 	// prefixListNames is a list of the generated prefix list names in the same order as the groups.
 	prefixListNames []string
 
-	// prefixListNamesToExistingPrefixLists maps prefix list names to EC2 prefix list objects
+	// prefixListNamesToExistingPrefixLists maps prefix list names to EC2 prefix list objects.
 	prefixListNamesToExistingPrefixLists map[string]*ec2.ManagedPrefixList
 }
 
