@@ -14,9 +14,10 @@
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# MacOS, VSCode
+# MacOS, VSCode, log files
 .DS_Store
 .vscode
+*.log
 
 # Generated exectuable
 manage-aws-prefix-lists
