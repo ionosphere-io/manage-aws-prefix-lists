@@ -12,6 +12,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/aws-sdk-go/service/sts"
 )
 
@@ -28,6 +29,9 @@ type PrefixListManager struct {
 
 	// ec2 is a handle to the EC2 service.
 	ec2 *ec2.EC2
+
+	// ssm is a handle to the SSM service
+	ssm *ssm.SSM
 
 	// request is the incoming request we're handling
 	request *ManageAWSPrefixListsRequest
@@ -50,6 +54,7 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 	awsSession := session.New()
 	stsClient := sts.New(awsSession)
 	plm.ec2 = ec2.New(awsSession)
+	plm.ssm = ssm.New(awsSession)
 
 	// Figure out our account id and partition
 	callerID, err := stsClient.GetCallerIdentity(&sts.GetCallerIdentityInput{})
@@ -67,8 +72,8 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 	plm.partition = callerIDARN.Partition
 	plm.request = request
 
-	plm.ipv4 = NewPrefixListAddressFamilyManager(plm.partition, plm.accountID, plm.ec2, "IPv4", plm.request.GroupSize, plm.request.PrefixListTags)
-	plm.ipv6 = NewPrefixListAddressFamilyManager(plm.partition, plm.accountID, plm.ec2, "IPv6", plm.request.GroupSize, plm.request.PrefixListTags)
+	plm.ipv4 = NewPrefixListAddressFamilyManager(plm.partition, plm.accountID, plm.ec2, plm.ssm, "IPv4", plm.request.GroupSize, plm.request.PrefixListTags)
+	plm.ipv6 = NewPrefixListAddressFamilyManager(plm.partition, plm.accountID, plm.ec2, plm.ssm, "IPv6", plm.request.GroupSize, plm.request.PrefixListTags)
 
 	return plm, nil
 }
@@ -143,8 +148,15 @@ func (plm *PrefixListManager) Process() ([]PrefixListManagementOp, error) {
 	}
 
 	// And perform updates.
-	ops := plm.ipv4.updateManagedPrefixLists()
+	var ops []PrefixListManagementOp
+	ops = append(ops, plm.ipv4.updateManagedPrefixLists()...)
 	ops = append(ops, plm.ipv6.updateManagedPrefixLists()...)
+
+	// Copy any results to SSM.
+	ops = append(ops, plm.ipv4.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv4Parameters, plm.request.SSMParameters.Tags,
+		plm.request.SSMParameters.Tier)...)
+	ops = append(ops, plm.ipv4.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv6Parameters, plm.request.SSMParameters.Tags,
+		plm.request.SSMParameters.Tier)...)
 
 	return ops, nil
 }

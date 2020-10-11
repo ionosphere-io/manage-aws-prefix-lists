@@ -6,6 +6,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log"
 	"os"
 
 	"github.com/aws/aws-lambda-go/lambda"
@@ -59,6 +60,7 @@ func main() {
 
 // HandleLambdaRequest is the main Lambda entrypoint for updating a prefix list from ip-ranges.json.
 func HandleLambdaRequest(ctx context.Context, request ManageAWSPrefixListsRequest) (string, error) {
+	log.Printf("Incoming request: %v", request)
 	var ops []PrefixListManagementOp
 
 	plm, err := NewPrefixListManagerFromRequest(ctx, &request)

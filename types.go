@@ -285,6 +285,7 @@ func (req *ManageAWSPrefixListsRequest) UnmarshalJSON(data []byte) error {
 
 	var ssmParameters SSMParameters
 	if raw.SSMParameters != nil {
+		log.Printf("Got SSMParameters: %T %v", raw.SSMParameters, raw.SSMParameters)
 		ssmParameters = *raw.SSMParameters
 	}
 
@@ -459,18 +460,45 @@ type SSMParameters struct {
 	Tier string `json:"Tier"`
 }
 
+type ssmParametersRaw struct {
+	// IPv4Parameters is a list of SSM parameter names to write IPv4 prefix list IDs to.
+	IPv4Parameters []string `json:"IPv4Parameters"`
+
+	// IPv6Parametes is a list of SSM parameter names to write IPv6 prefix list IDs to.
+	IPv6Parameters []string `json:"IPv6Parameters"`
+
+	// Tags is a map of key-value pairs OR a list of {"Key": key, "Value": value} tuples.
+	Tags TagMap `json:"Tags"`
+
+	// Tier is the SSM tier to use: "Standard", "Advanced", or "Intelligent-Tiering". If unspecified, this defaults to "Standard".
+	Tier string `json:"Tier"`
+}
+
+// UnmarshalJSON converts a JSON value to an SSMParameters struct
+func (sp *SSMParameters) UnmarshalJSON(data []byte) error {
+	raw := ssmParametersRaw{Tags: make(TagMap)}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	sp.IPv4Parameters = raw.IPv4Parameters
+	sp.IPv6Parameters = raw.IPv6Parameters
+	sp.Tags = raw.Tags
+	sp.Tier = raw.Tier
+
+	return nil
+}
+
 // TagMap is a mapping of key-value pairs.
 type TagMap map[string]string
 
-// UnmarshalJSON converts JSON data to an IPAddressTypeEnum.
+// UnmarshalJSON converts JSON data to a TagMap.
 func (tm *TagMap) UnmarshalJSON(data []byte) error {
 	var value interface{}
 
 	if err := json.Unmarshal(data, &value); err != nil {
 		return err
 	}
-
-	log.Printf("TagMap: value is %T", value)
 
 	if listOfKV, ok := value.([]interface{}); ok {
 		for _, el := range listOfKV {
@@ -558,16 +586,18 @@ type PrefixListManagementOp struct {
 	ExistingPrefixListID string
 	NewPrefixListID      string
 	SecurityGroupID      string
+	SSMParameterName     string
 	Error                error
 }
 
 type prefixListManagementOpJSON struct {
-	PrefixListName       string            `json:"PrefixListName"`
-	AddressFamily        string            `json:"AddressFamily"`
 	Operation            OperationType     `json:"Operation"`
+	AddressFamily        string            `json:"AddressFamily"`
+	PrefixListName       string            `json:"PrefixListName,omitempty"`
 	ExistingPrefixListID string            `json:"ExistingPrefixListId,omitempty"`
 	NewPrefixListID      string            `json:"NewPrefixListId,omitempty"`
 	SecurityGroupID      string            `json:"SecurityGroupId,omitempty"`
+	SSMParameterName     string            `json:"SSMParameterName,omitempty"`
 	Error                map[string]string `json:"Error,omitempty"`
 }
 
@@ -607,12 +637,15 @@ func (plmop *PrefixListManagementOp) MarshalJSON() ([]byte, error) {
 }
 
 // OperationType enumerates the types of operations we can perform on a prefix list.
+// This requires enumer: go get github.com/alvaroloes/enumer
 type OperationType uint
 
+//go:generate enumer -json -type=OperationType
+
 const (
-	// OpNoModification indicates that no modification to an existing prefix list was required.
+	// OpNoModifyPrefixList indicates that no modification to an existing prefix list was required.
 	// ExistingPrefixListID will contain the prefix list id that was considered; NewPrefixListID will be empty.
-	OpNoModification OperationType = iota
+	OpNoModifyPrefixList OperationType = iota
 
 	// OpCreatePrefixList indicates that an existing prefix list was not found and a new one was created.
 	// ExistingPrefixListID will be empty; NewPrefixListID will contain the prefix list id that was created.
@@ -661,39 +694,46 @@ const (
 	// Error will be populated with the error that occurred. ExistingPrefixListID will contain the prefix list id that contained
 	// referenced security group, and SecurityGroupID will contain the security group id that failed to update.
 	OpSecurityGroupUpdateFailedError
-)
 
-// MarshalJSON converts an OperationType enumeration to a string
-func (op OperationType) MarshalJSON() ([]byte, error) {
-	switch op {
-	case OpNoModification:
-		return []byte(`"NoModification"`), nil
-	case OpCreatePrefixList:
-		return []byte(`"CreatePrefixList"`), nil
-	case OpUpdatePrefixListEntries:
-		return []byte(`"UpdatePrefixListEntries"`), nil
-	case OpReplacePrefixList:
-		return []byte(`"ReplacePrefixList"`), nil
-	case OpPrefixListQueryFailedError:
-		return []byte(`"PrefixListQueryFailedError"`), nil
-	case OpPrefixListCreateFailedError:
-		return []byte(`"PrefixListCreateFailedError"`), nil
-	case OpPrefixListDeleteFailedError:
-		return []byte(`"PrefixListDeleteFailedError"`), nil
-	case OpPrefixListUpdateFailedError:
-		return []byte(`"PrefixListUpdateFailedError"`), nil
-	case OpUpdateSecurityGroupIngress:
-		return []byte(`"UpdateSecurityGroupIngress"`), nil
-	case OpUpdateSecurityGroupEgress:
-		return []byte(`"UpdateSecurityGroupEgress"`), nil
-	case OpSecurityGroupQueryFailedError:
-		return []byte(`"SecurityGroupQueryFailedError"`), nil
-	case OpSecurityGroupUpdateFailedError:
-		return []byte(`"SecurityGroupUpdateFailedError"`), nil
-	default:
-		return []byte(fmt.Sprintf(`"Unknown operation code %d"`, uint(op))), nil
-	}
-}
+	// OpNoModifySSMParameterValue indicates that an SSM parameter was up-to-date.
+	// SSMParameterName will contain the name of the parameter that was queried but left intact.
+	OpNoModifySSMParameterValue
+
+	// OpSSMParameterCreated indicates that an SSM parameter was created.
+	// SSMParameterName will contain the name of the parameter that was created.
+	OpSSMParameterCreated
+
+	// OpSSMParameterValueUpdated indicates that an SSM parameter value was updated.
+	// SSMParameterName will contain the name of the parameter that was updated.
+	OpSSMParameterValueUpdated
+
+	// OpNoModifySSMParameterTags indicates that an SSM parameter's tags were up-to-date.
+	// SSMParameterName will contain the name of the parameter that was queried but left intact.
+	OpNoModifySSMParameterTags
+
+	// OpSSMParameterTagsUpdated indicates that an SSM parameter had tags added or updated.
+	// SSMParameterName will contain the name of the parameter that was updated.
+	OpSSMParameterTagsUpdated
+
+	// OpSSMQueryFailedError indicates that one or more SSM parameters could not be queried.
+	// Error will be populated with the error that occurred.
+	OpSSMQueryFailedError
+
+	// OpSSMParameterCreateFailedError indicates that an SSM parameter could not be created.
+	// Error will be populated with the error that occurred. SSMParameterName will contain the name of the parameter that failed
+	// to update.
+	OpSSMParameterCreateFailedError
+
+	// OpSSMParameterValueUpdateFailedError indicates that an SSM parameter value could not be updated.
+	// Error will be populated with the error that occurred. SSMParameterName will contain the name of the parameter that failed
+	// to update.
+	OpSSMParameterValueUpdateFailedError
+
+	// OpSSMParameterTagsUpdateFailedError indicates that an SSM parameter could not have its tags updated.
+	// Error will be populated with the error that occurred. SSMParameterName will contain the name of the parameter that failed
+	// to update.
+	OpSSMParameterTagsUpdateFailedError
+)
 
 // MakeEC2Filter creates an EC2 filter specification with the specified key and values
 func MakeEC2Filter(name string, values ...string) *ec2.Filter {

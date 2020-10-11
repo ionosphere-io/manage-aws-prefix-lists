@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 	"text/template"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/ssm"
 )
 
 // PrefixListAddressFamilyManager handles the data related to a specific address family
@@ -23,6 +25,9 @@ type PrefixListAddressFamilyManager struct {
 
 	// ec2 is a handle to the EC2 service.
 	ec2 *ec2.EC2
+
+	// ssm is a handle to the (Simple) Systems Manager service.
+	ssm *ssm.SSM
 
 	// addressFamily is the IP protocol, either "IPv4" or "IPv6"
 	addressFamily string
@@ -53,10 +58,11 @@ type PrefixListAddressFamilyManager struct {
 }
 
 // NewPrefixListAddressFamilyManager creates a new PrefixListAddressFamilyManager object with the specified parameters.
-func NewPrefixListAddressFamilyManager(partition string, accountID string, ec2Client *ec2.EC2, addressFamily string, groupSize uint, prefixListTags TagMap) *PrefixListAddressFamilyManager {
+func NewPrefixListAddressFamilyManager(partition string, accountID string, ec2Client *ec2.EC2, ssmClient *ssm.SSM,
+	addressFamily string, groupSize uint, prefixListTags TagMap) *PrefixListAddressFamilyManager {
 	return &PrefixListAddressFamilyManager{
-		partition: partition, accountID: accountID, ec2: ec2Client,
-		addressFamily: addressFamily, groupSize: groupSize, tags: prefixListTags,
+		partition: partition, accountID: accountID, ec2: ec2Client, ssm: ssmClient, addressFamily: addressFamily,
+		groupSize: groupSize, tags: prefixListTags,
 	}
 }
 
@@ -321,7 +327,7 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 		log.Printf("Prefix list %s (%s) is up-to-date; no modifications needed", existingPrefixListID, prefixListName)
 		// Nothing to do -- report back a no-op
 		return []PrefixListManagementOp{{
-			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpNoModification,
+			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpNoModifyPrefixList,
 			ExistingPrefixListID: existingPrefixListID,
 		}}
 	}
@@ -651,6 +657,163 @@ func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(secu
 					ExistingPrefixListID: existingPrefixListID, NewPrefixListID: newPrefixListID, SecurityGroupID: *securityGroup.GroupId,
 				})
 			}
+		}
+	}
+
+	return results
+}
+
+// updateSSMWithPrefixListIDs updates the specified SSM parameters with the prefix list ids considered final.
+func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(parameters []string, tags TagMap, tier string) []PrefixListManagementOp {
+	// If there are no parameters, there's nothing to do. Short-circuit here so we don't have to keep validating for AWS.
+	if len(parameters) == 0 {
+		return nil
+	}
+
+	if tier == "" {
+		tier = "Standard"
+	}
+
+	// The parameters in a string list are comma-separated.
+	sort.Strings(plafm.prefixListIDs)
+	expectedValue := strings.Join(plafm.prefixListIDs, ",")
+
+	parameterPtrs := make([]*string, 0, len(parameters))
+	for _, parameter := range parameters {
+		parameterPtrs = append(parameterPtrs, aws.String(parameter))
+	}
+
+	output, err := plafm.ssm.GetParameters(&ssm.GetParametersInput{Names: parameterPtrs, WithDecryption: aws.Bool(false)})
+	if err != nil {
+		log.Printf("Failed to get SSM parameters %v: %v", parameters, err)
+		return []PrefixListManagementOp{{
+			Operation: OpSSMQueryFailedError, AddressFamily: plafm.addressFamily, Error: err,
+		}}
+	}
+
+	var results []PrefixListManagementOp
+
+	// Keep track of which parameters we've seen -- we'll create ones we haven't seen.
+	unseenParameters := make(map[string]bool)
+	for _, parameter := range parameters {
+		unseenParameters[parameter] = true
+	}
+
+	for _, parameter := range output.Parameters {
+		delete(unseenParameters, *parameter.Name)
+
+		pValue := aws.StringValue(parameter.Value)
+		// Make sure the values are correct.
+		if aws.StringValue(parameter.Type) != "StringList" || pValue != expectedValue {
+			// Update needed.
+			log.Printf("Updating parameter value of %s from %s to %s", *parameter.Name, pValue, expectedValue)
+			_, err := plafm.ssm.PutParameter(&ssm.PutParameterInput{Name: parameter.Name, Type: aws.String("StringList"),
+				Value: &expectedValue, Overwrite: aws.Bool(true)})
+			if err != nil {
+				log.Printf("Failed to update parameter value for %s: %v", *parameter.Name, err)
+				results = append(results, PrefixListManagementOp{
+					AddressFamily: plafm.addressFamily, Operation: OpSSMParameterValueUpdateFailedError,
+					SSMParameterName: *parameter.Name, Error: err,
+				})
+			} else {
+				results = append(results, PrefixListManagementOp{
+					AddressFamily: plafm.addressFamily, Operation: OpSSMParameterValueUpdated,
+					SSMParameterName: *parameter.Name,
+				})
+			}
+		} else {
+			log.Printf("SSM parameter %s value is up-to-date", *parameter.Name)
+		}
+
+		// And check the tags for this resource
+		output, err := plafm.ssm.ListTagsForResource(&ssm.ListTagsForResourceInput{
+			ResourceId: parameter.Name, ResourceType: aws.String("Parameter")})
+		if err != nil {
+			log.Printf("Failed to get tags for SSM parameter %s: %v", *parameter.Name, err)
+			results = append(results, PrefixListManagementOp{
+				AddressFamily: plafm.addressFamily, Operation: OpSSMQueryFailedError, SSMParameterName: *parameter.Name,
+				Error: err,
+			})
+		} else {
+			tagsNotSeen := make(map[string]string)
+			var tagsToAdd []*ssm.Tag
+
+			for key, value := range tags {
+				tagsNotSeen[key] = value
+			}
+
+			for _, tag := range output.TagList {
+				expectedValue, present := tagsNotSeen[*tag.Key]
+
+				// Ignore tags that have been added -- the user may have added them for additional tracking purposes.
+				if !present {
+					continue
+				}
+
+				delete(tagsNotSeen, *tag.Key)
+
+				// If the value isn't correct, mark the tag for addition.
+				if expectedValue != *tag.Value {
+					tagsToAdd = append(tagsToAdd, &ssm.Tag{Key: tag.Key, Value: aws.String(expectedValue)})
+				}
+			}
+
+			// Add any tags that weren't seen in our enumeration.
+			for key, value := range tagsNotSeen {
+				tagsToAdd = append(tagsToAdd, &ssm.Tag{Key: aws.String(key), Value: aws.String(value)})
+			}
+
+			if len(tagsToAdd) > 0 {
+				// We need an update here.
+				log.Printf("Adding/updating SSM parameter %s tags: %v", *parameter.Name, tags)
+				_, err := plafm.ssm.AddTagsToResource(&ssm.AddTagsToResourceInput{
+					ResourceId: parameter.Name, ResourceType: aws.String("Parameter"), Tags: tagsToAdd})
+				if err != nil {
+					log.Printf("Failed to add/update tags for parameter %s: %v", *parameter.Name, err)
+					results = append(results, PrefixListManagementOp{
+						Operation: OpSSMParameterTagsUpdateFailedError, AddressFamily: plafm.addressFamily,
+						SSMParameterName: *parameter.Name, Error: err,
+					})
+				} else {
+					results = append(results, PrefixListManagementOp{
+						Operation: OpSSMParameterTagsUpdated, AddressFamily: plafm.addressFamily, SSMParameterName: *parameter.Name,
+						Error: err,
+					})
+				}
+			} else {
+				log.Printf("SSM parameter %s tags are up-to-date", *parameter.Name)
+				results = append(results, PrefixListManagementOp{
+					Operation: OpNoModifySSMParameterTags, AddressFamily: plafm.addressFamily, SSMParameterName: *parameter.Name,
+					Error: err,
+				})
+			}
+		}
+	}
+
+	// Create any parameters that weren't seen
+	var ssmTags []*ssm.Tag
+	for key, value := range tags {
+		ssmTags = append(ssmTags, &ssm.Tag{Key: aws.String(key), Value: aws.String(value)})
+	}
+
+	for parameterName := range unseenParameters {
+		log.Printf("Creating SSM parameter %s with value %s and tags %v", parameterName, expectedValue, tags)
+		_, err := plafm.ssm.PutParameter(&ssm.PutParameterInput{
+			Name: aws.String(parameterName), Value: aws.String(expectedValue), Type: aws.String("StringList"),
+			Tags: ssmTags, Tier: aws.String(tier), Overwrite: aws.Bool(false),
+		})
+
+		if err != nil {
+			log.Printf("Failed to create SSM parameter %s: %v", parameterName, err)
+			results = append(results, PrefixListManagementOp{
+				Operation: OpSSMParameterCreateFailedError, AddressFamily: plafm.addressFamily, SSMParameterName: parameterName,
+				Error: err,
+			})
+		} else {
+			results = append(results, PrefixListManagementOp{
+				Operation: OpSSMParameterCreated, AddressFamily: plafm.addressFamily, SSMParameterName: parameterName,
+				Error: err,
+			})
 		}
 	}
 
