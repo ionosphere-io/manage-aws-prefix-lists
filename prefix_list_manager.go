@@ -155,7 +155,7 @@ func (plm *PrefixListManager) Process() ([]PrefixListManagementOp, error) {
 	// Copy any results to SSM.
 	ops = append(ops, plm.ipv4.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv4Parameters, plm.request.SSMParameters.Tags,
 		plm.request.SSMParameters.Tier)...)
-	ops = append(ops, plm.ipv4.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv6Parameters, plm.request.SSMParameters.Tags,
+	ops = append(ops, plm.ipv6.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv6Parameters, plm.request.SSMParameters.Tags,
 		plm.request.SSMParameters.Tier)...)
 
 	return ops, nil
