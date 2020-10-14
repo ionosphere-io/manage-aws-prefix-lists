@@ -195,6 +195,7 @@ func (plafm *PrefixListAddressFamilyManager) mapPrefixListNamesToExistingPrefixL
 		})
 
 		if err != nil {
+			fmt.Printf("Failed to describe managed prefix lists with name %s: %v", prefixListName, err)
 			return err
 		}
 
