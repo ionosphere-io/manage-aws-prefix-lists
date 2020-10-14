@@ -14,10 +14,11 @@
 # Dependency directories (remove the comment below to include it)
 # vendor/
 
-# MacOS, VSCode, log files
+# MacOS, VSCode, log files, generated Lambda ZIP.
 .DS_Store
 .vscode
 *.log
+*.zip
 
 # Generated exectuable
 manage-aws-prefix-lists
