@@ -12,7 +12,9 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 )
 
 // PrefixListAddressFamilyManager handles the data related to a specific address family
@@ -24,10 +26,10 @@ type PrefixListAddressFamilyManager struct {
 	accountID string
 
 	// ec2 is a handle to the EC2 service.
-	ec2 *ec2.EC2
+	ec2 ec2iface.EC2API
 
 	// ssm is a handle to the (Simple) Systems Manager service.
-	ssm *ssm.SSM
+	ssm ssmiface.SSMAPI
 
 	// addressFamily is the IP protocol, either "IPv4" or "IPv6"
 	addressFamily string
@@ -58,7 +60,7 @@ type PrefixListAddressFamilyManager struct {
 }
 
 // NewPrefixListAddressFamilyManager creates a new PrefixListAddressFamilyManager object with the specified parameters.
-func NewPrefixListAddressFamilyManager(partition string, accountID string, ec2Client *ec2.EC2, ssmClient *ssm.SSM,
+func NewPrefixListAddressFamilyManager(partition string, accountID string, ec2Client ec2iface.EC2API, ssmClient ssmiface.SSMAPI,
 	addressFamily string, groupSize uint, prefixListTags TagMap) *PrefixListAddressFamilyManager {
 	return &PrefixListAddressFamilyManager{
 		partition: partition, accountID: accountID, ec2: ec2Client, ssm: ssmClient, addressFamily: addressFamily,

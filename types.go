@@ -44,6 +44,15 @@ const SleepDuration time.Duration = 200 * time.Millisecond
 // TemplateFuncs is a map of template functions.
 var TemplateFuncs template.FuncMap
 
+// EC2ClientKey is a context key to use for retrieving an ec2iface.EC2API value from a context
+var EC2ClientKey EC2ClientKeyType
+
+// SSMClientKey is a context key to use for retrieving an ssmiface.STSAPI value from a context
+var SSMClientKey SSMClientKeyType
+
+// STSClientKey is a context key to use for retrieving an stsiface.STSAPI value from a context
+var STSClientKey STSClientKeyType
+
 func init() {
 	MatchAllRegex = regexp.MustCompile(".*")
 
@@ -759,6 +768,15 @@ func MakeEC2TagSpec(tagMap TagMap, resourceType *string) []*ec2.TagSpecification
 	tagSpec := ec2.TagSpecification{ResourceType: resourceType, Tags: MakeEC2Tags(tagMap)}
 	return []*ec2.TagSpecification{&tagSpec}
 }
+
+// EC2ClientKeyType is a context key structure identifying an ec2iface.EC2API to use when making API calls (for testing).
+type EC2ClientKeyType struct{}
+
+// SSMClientKeyType is a context key structure identifying an ssmiface.SSMAPI to use when making API calls (for testing).
+type SSMClientKeyType struct{}
+
+// STSClientKeyType is a context key structure identifying an stsiface.STSAPI to use when making API calls (for testing).
+type STSClientKeyType struct{}
 
 // CompareIPNets compares two IP networks, ordering them first by IP address, then by prefix.
 //

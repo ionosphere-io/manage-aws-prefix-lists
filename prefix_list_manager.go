@@ -12,8 +12,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
+	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/ssm"
+	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 	"github.com/aws/aws-sdk-go/service/sts"
+	"github.com/aws/aws-sdk-go/service/sts/stsiface"
 )
 
 // PrefixListManager is the main structure for holding the state of the prefix list manager application.
@@ -28,10 +31,10 @@ type PrefixListManager struct {
 	accountID string
 
 	// ec2 is a handle to the EC2 service.
-	ec2 *ec2.EC2
+	ec2 ec2iface.EC2API
 
 	// ssm is a handle to the SSM service
-	ssm *ssm.SSM
+	ssm ssmiface.SSMAPI
 
 	// request is the incoming request we're handling
 	request *ManageAWSPrefixListsRequest
@@ -52,9 +55,27 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 	plm := new(PrefixListManager)
 
 	awsSession := session.New()
-	stsClient := sts.New(awsSession)
-	plm.ec2 = ec2.New(awsSession)
-	plm.ssm = ssm.New(awsSession)
+	var present bool
+
+	var ec2Client ec2iface.EC2API
+	var ssmClient ssmiface.SSMAPI
+	var stsClient stsiface.STSAPI
+
+	// Retrieve interfaces from the context if they're present (for testing).
+	if ec2Client, present = ctx.Value(EC2ClientKey).(ec2iface.EC2API); !present {
+		ec2Client = ec2.New(awsSession)
+	}
+
+	if ssmClient, present = ctx.Value(SSMClientKey).(ssmiface.SSMAPI); !present {
+		ssmClient = ssm.New(awsSession)
+	}
+
+	if stsClient, present = ctx.Value(STSClientKey).(stsiface.STSAPI); !present {
+		stsClient = sts.New(awsSession)
+	}
+
+	plm.ec2 = ec2Client
+	plm.ssm = ssmClient
 
 	// Figure out our account id and partition
 	callerID, err := stsClient.GetCallerIdentity(&sts.GetCallerIdentityInput{})
