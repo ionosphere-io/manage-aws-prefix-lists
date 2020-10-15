@@ -1,27 +1,16 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
-	"net"
 	"regexp"
-	"sort"
 	"strings"
 	"text/template"
 	"time"
-	"unicode"
 
-	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/arn"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/service/ec2"
 )
-
-// MatchAllRegex is a regular expression that matches everything.
-var MatchAllRegex *regexp.Regexp
 
 // DefaultPrefixListNameTemplate is the default template used when a template is not specified.
 const DefaultPrefixListNameTemplate string = "{{.PrefixListNameBase}}.{{lower .AddressFamily}}.{{.GroupID}}"
@@ -40,149 +29,6 @@ const MaxRetries uint = 5
 
 // SleepDuration is the amount of time to sleep before refreshing state
 const SleepDuration time.Duration = 200 * time.Millisecond
-
-// TemplateFuncs is a map of template functions.
-var TemplateFuncs template.FuncMap
-
-// EC2ClientKey is a context key to use for retrieving an ec2iface.EC2API value from a context
-var EC2ClientKey EC2ClientKeyType
-
-// SSMClientKey is a context key to use for retrieving an ssmiface.STSAPI value from a context
-var SSMClientKey SSMClientKeyType
-
-// STSClientKey is a context key to use for retrieving an stsiface.STSAPI value from a context
-var STSClientKey STSClientKeyType
-
-func init() {
-	MatchAllRegex = regexp.MustCompile(".*")
-
-	TemplateFuncs = make(template.FuncMap)
-	TemplateFuncs["upper"] = strings.ToUpper
-	TemplateFuncs["lower"] = strings.ToLower
-	TemplateFuncs["title"] = strings.Title
-	TemplateFuncs["replace"] = strings.Replace
-	TemplateFuncs["trim"] = func(args ...string) (string, error) {
-		switch len(args) {
-		case 0:
-			return "", nil
-		case 1:
-			return strings.TrimFunc(args[0], unicode.IsSpace), nil
-		case 2:
-			return strings.Trim(args[0], args[1]), nil
-		default:
-			return "", fmt.Errorf("Too many arguments passed to trim function: %v", args)
-		}
-	}
-	TemplateFuncs["trimleft"] = func(args ...string) (string, error) {
-		switch len(args) {
-		case 0:
-			return "", nil
-		case 1:
-			return strings.TrimLeftFunc(args[0], unicode.IsSpace), nil
-		case 2:
-			return strings.TrimLeft(args[0], args[1]), nil
-		default:
-			return "", fmt.Errorf("Too many arguments passed to trim function: %v", args)
-		}
-	}
-	TemplateFuncs["trimright"] = func(args ...string) (string, error) {
-		switch len(args) {
-		case 0:
-			return "", nil
-		case 1:
-			return strings.TrimRightFunc(args[0], unicode.IsSpace), nil
-		case 2:
-			return strings.TrimRight(args[0], args[1]), nil
-		default:
-			return "", fmt.Errorf("Too many arguments passed to trim function: %v", args)
-		}
-	}
-}
-
-// IPRanges is the structure of the ip-ranges.json document.
-type IPRanges struct {
-	SyncToken    string       `json:"syncToken"`
-	CreateDate   string       `json:"createDate"`
-	Prefixes     []IPv4Prefix `json:"prefixes"`
-	IPv6Prefixes []IPv6Prefix `json:"ipv6_prefixes"`
-}
-
-// IPPrefix is a common interface for IPv4Prefix and IPv6Prefix
-type IPPrefix interface {
-	GetAddressType() IPAddressTypeEnum
-	GetPrefix() string
-	GetRegion() string
-	GetService() string
-	GetNetworkBorderGroup() string
-}
-
-// IPv4Prefix is the structure of an IPv4 prefix in the ip-ranges.json document.
-type IPv4Prefix struct {
-	IPPrefix           string `json:"ip_prefix"`
-	Region             string `json:"region"`
-	Service            string `json:"service"`
-	NetworkBorderGroup string `json:"network_border_group"`
-}
-
-// IPv6Prefix is the structure of an IPv6 prefix in the ip-ranges.json document.
-type IPv6Prefix struct {
-	IPv6Prefix         string `json:"ipv6_prefix"`
-	Region             string `json:"region"`
-	Service            string `json:"service"`
-	NetworkBorderGroup string `json:"network_border_group"`
-}
-
-// GetAddressType returns the address type (IPv4 or IPv6) of this prefix.
-func (ip *IPv4Prefix) GetAddressType() IPAddressTypeEnum {
-	return IPAddressTypeIPv4
-}
-
-// GetPrefix returns the IP prefix.
-func (ip *IPv4Prefix) GetPrefix() string {
-	return ip.IPPrefix
-}
-
-// GetRegion returns the AWS region this prefix applies to.
-func (ip *IPv4Prefix) GetRegion() string {
-	return ip.Region
-}
-
-// GetService returns the AWS service this prefix applies to.
-func (ip *IPv4Prefix) GetService() string {
-	return ip.Service
-}
-
-// GetNetworkBorderGroup returns the AWS network border group this prefix applies to.
-// This is different than the region for local regions (us-west-2-lax-1) and AWS Wavelength zones.
-func (ip *IPv4Prefix) GetNetworkBorderGroup() string {
-	return ip.NetworkBorderGroup
-}
-
-// GetAddressType returns the address type (IPv4 or IPv6) of this prefix.
-func (ip *IPv6Prefix) GetAddressType() IPAddressTypeEnum {
-	return IPAddressTypeIPv6
-}
-
-// GetPrefix returns the IP prefix.
-func (ip *IPv6Prefix) GetPrefix() string {
-	return ip.IPv6Prefix
-}
-
-// GetRegion returns the AWS region this prefix applies to.
-func (ip *IPv6Prefix) GetRegion() string {
-	return ip.Region
-}
-
-// GetService returns the AWS service this prefix applies to.
-func (ip *IPv6Prefix) GetService() string {
-	return ip.Service
-}
-
-// GetNetworkBorderGroup returns the AWS network border group this prefix applies to.
-// This is different than the region for local regions (us-west-2-lax-1) and AWS Wavelength zones.
-func (ip *IPv6Prefix) GetNetworkBorderGroup() string {
-	return ip.NetworkBorderGroup
-}
 
 // ManageAWSPrefixListsRequest is the structure an incoming event is expected to adhere to.
 type ManageAWSPrefixListsRequest struct {
@@ -351,7 +197,7 @@ func (req *ManageAWSPrefixListsRequest) UnmarshalJSON(data []byte) error {
 
 // IPRangesFilter is a filter for the ip-ranges.json file.
 type IPRangesFilter struct {
-	IPAddressType           IPAddressTypeEnum
+	AddressFamily           AddressFamily
 	RegionRegex             *regexp.Regexp
 	ServiceRegex            *regexp.Regexp
 	NetworkBorderGroupRegex *regexp.Regexp
@@ -359,13 +205,13 @@ type IPRangesFilter struct {
 
 // ipRangesFilterRaw represents the raw JSON message passed to us for an IPRangesFilter expression.
 type ipRangesFilterRaw struct {
-	IPAddressType           IPAddressTypeEnum `json:"IPAddressType"`
-	Region                  *string           `json:"Region"`
-	RegionRegex             *string           `json:"RegionRegex"`
-	Service                 *string           `json:"Service"`
-	ServiceRegex            *string           `json:"ServiceRegex"`
-	NetworkBorderGroup      *string           `json:"NetworkBorderGroup"`
-	NetworkBorderGroupRegex *string           `json:"NetworkBorderGroupRegex"`
+	AddressFamily           AddressFamily `json:"AddressFamily"`
+	Region                  *string       `json:"Region"`
+	RegionRegex             *string       `json:"RegionRegex"`
+	Service                 *string       `json:"Service"`
+	ServiceRegex            *string       `json:"ServiceRegex"`
+	NetworkBorderGroup      *string       `json:"NetworkBorderGroup"`
+	NetworkBorderGroupRegex *string       `json:"NetworkBorderGroupRegex"`
 }
 
 // UnmarshalJSON converts JSON data to an IPRangesFilter.
@@ -391,7 +237,7 @@ func (irf *IPRangesFilter) UnmarshalJSON(data []byte) error {
 		return err
 	}
 
-	irf.IPAddressType = raw.IPAddressType
+	irf.AddressFamily = raw.AddressFamily
 	irf.RegionRegex = regionRegex
 	irf.ServiceRegex = serviceRegex
 	irf.NetworkBorderGroupRegex = networkBorderGroupRegex
@@ -419,22 +265,22 @@ func parseStringOrRegexp(parameterName string, stringValue *string, regexValue *
 	return nil, fmt.Errorf("Cannot specify both %s and %sRegexp parameters in filter", parameterName, parameterName)
 }
 
-// IPAddressTypeEnum is an enumeration of the possible types of IP addresses to filter on.
-type IPAddressTypeEnum uint
+// AddressFamily is an enumeration of the possible types of IP addresses to filter on.
+type AddressFamily uint
 
 const (
-	// IPAddressTypeAll indicates all types of IP addresses (IPv4, IPv6) should be queried
-	IPAddressTypeAll IPAddressTypeEnum = iota
+	// AddressFamilyAll indicates all types of IP addresses (IPv4, IPv6) should be queried
+	AddressFamilyAll AddressFamily = iota
 
-	// IPAddressTypeIPv4 indicates only IPv4 addresses should be queried
-	IPAddressTypeIPv4
+	// AddressFamilyIPv4 indicates only IPv4 addresses should be queried
+	AddressFamilyIPv4
 
-	// IPAddressTypeIPv6 indicates only IPv6 addresses should be queried
-	IPAddressTypeIPv6
+	// AddressFamilyIPv6 indicates only IPv6 addresses should be queried
+	AddressFamilyIPv6
 )
 
-// UnmarshalJSON converts JSON data to an IPAddressTypeEnum
-func (ipate *IPAddressTypeEnum) UnmarshalJSON(data []byte) error {
+// UnmarshalJSON converts JSON string to an AddressFamily.
+func (ipate *AddressFamily) UnmarshalJSON(data []byte) error {
 	var rawValue string
 	if err := json.Unmarshal(data, &rawValue); err != nil {
 		return err
@@ -442,13 +288,13 @@ func (ipate *IPAddressTypeEnum) UnmarshalJSON(data []byte) error {
 
 	switch rawValue {
 	case "ALL":
-		*ipate = IPAddressTypeAll
+		*ipate = AddressFamilyAll
 	case "IPv4":
-		*ipate = IPAddressTypeIPv4
+		*ipate = AddressFamilyIPv4
 	case "IPv6":
-		*ipate = IPAddressTypeIPv6
+		*ipate = AddressFamilyIPv6
 	default:
-		return fmt.Errorf("Invalid value for IPAddressTypeEnum; expected \"ALL\", \"IPv4\", or \"IPv6\": %v", string(data))
+		return fmt.Errorf("Invalid value for AddressFamily; expected \"ALL\", \"IPv4\", or \"IPv6\": %v", string(data))
 	}
 
 	return nil
@@ -502,6 +348,11 @@ func (sp *SSMParameters) UnmarshalJSON(data []byte) error {
 type TagMap map[string]string
 
 // UnmarshalJSON converts JSON data to a TagMap.
+//
+// This is customized to allow two different formats:
+//
+// * The AWS format, containing an array of JSON objects in the form: [{"Key": "tagKey", "Value": "tagValue"}, ...]
+// * The Terraform format, consisting of a JSON object in the form: {"tagKey": "tagValue", ...}
 func (tm *TagMap) UnmarshalJSON(data []byte) error {
 	var value interface{}
 
@@ -511,16 +362,23 @@ func (tm *TagMap) UnmarshalJSON(data []byte) error {
 
 	if listOfKV, ok := value.([]interface{}); ok {
 		for _, el := range listOfKV {
-			if kv, ok := el.(map[string]string); ok {
-				key, keyPresent := kv["Key"]
-				value, valuePresent := kv["Value"]
+			if kv, ok := el.(map[string]interface{}); ok {
+				keyAny, keyPresent := kv["Key"]
+				valueAny, valuePresent := kv["Value"]
 
-				if !keyPresent || !valuePresent {
-					return fmt.Errorf("Invalid element for Tags: expected a map containing \"Key\" and \"Value\": %v", el)
+				if !keyPresent || !valuePresent || len(kv) != 2 {
+					return fmt.Errorf("Invalid element for Tags: expected a map containing a string \"Key\" and string \"Value\": %v", el)
 				}
+
+				key, keyOk := keyAny.(string)
+				value, valueOk := valueAny.(string)
+				if !keyOk || !valueOk {
+					return fmt.Errorf("Invalid element for Tags: expected a map containing a string \"Key\" and string \"Value\": %v", el)
+				}
+
 				(*tm)[key] = value
 			} else {
-				return fmt.Errorf("Invalid element for Tags: expected a map containing \"Key\" and \"Value\": %v", el)
+				return fmt.Errorf("Invalid element for Tags: expected a map containing a string \"Key\" and string \"Value\": %v", el)
 			}
 		}
 	} else if mapOfKV, ok := value.(map[string]interface{}); ok {
@@ -567,7 +425,7 @@ func (te *TierEnum) UnmarshalJSON(data []byte) error {
 	case "Intelligent-Tiering":
 		*te = TierIntelligentTiering
 	default:
-		return fmt.Errorf("Invalid value for IPAddressTypeEnum; expected \"ALL\", \"IPv4\", or \"IPv6\": %v", string(data))
+		return fmt.Errorf(`Invalid value for Tier; expected "Standard", "Advanced", or "Intelligent-Tiering": %v`, string(data))
 	}
 
 	return nil
@@ -585,283 +443,4 @@ type PrefixListTemplateVars struct {
 	AddressFamily      string
 	GroupID            string
 	GroupCount         string
-}
-
-// PrefixListManagementOp describes the result of a prefix list management operation.
-type PrefixListManagementOp struct {
-	PrefixListName       string
-	AddressFamily        string
-	Operation            OperationType
-	ExistingPrefixListID string
-	NewPrefixListID      string
-	SecurityGroupID      string
-	SSMParameterName     string
-	Error                error
-}
-
-type prefixListManagementOpJSON struct {
-	Operation            OperationType     `json:"Operation"`
-	AddressFamily        string            `json:"AddressFamily"`
-	PrefixListName       string            `json:"PrefixListName,omitempty"`
-	ExistingPrefixListID string            `json:"ExistingPrefixListId,omitempty"`
-	NewPrefixListID      string            `json:"NewPrefixListId,omitempty"`
-	SecurityGroupID      string            `json:"SecurityGroupId,omitempty"`
-	SSMParameterName     string            `json:"SSMParameterName,omitempty"`
-	Error                map[string]string `json:"Error,omitempty"`
-}
-
-// MarshalJSON converts a PrefixListManagementOp to JSON format.
-//
-// This has special logic for formatting the Error field to a string.
-func (plmop *PrefixListManagementOp) MarshalJSON() ([]byte, error) {
-	raw := prefixListManagementOpJSON{
-		PrefixListName: plmop.PrefixListName, AddressFamily: plmop.AddressFamily, Operation: plmop.Operation,
-		ExistingPrefixListID: plmop.ExistingPrefixListID, NewPrefixListID: plmop.NewPrefixListID,
-		SecurityGroupID: plmop.NewPrefixListID,
-	}
-
-	if plmop.Error != nil {
-		raw.Error = make(map[string]string)
-
-		if awsErr, ok := plmop.Error.(awserr.Error); ok {
-			raw.Error["Type"] = "AWSError"
-			raw.Error["Code"] = awsErr.Code()
-			raw.Error["Message"] = awsErr.Message()
-
-			if origErr := awsErr.OrigErr(); origErr != nil {
-				raw.Error["Cause"] = fmt.Sprintf("%v", origErr)
-			}
-		} else {
-			raw.Error["Type"] = fmt.Sprintf("%T", plmop.Error)
-			raw.Error["Code"] = "InternalError"
-			raw.Error["Message"] = fmt.Sprintf("%v", plmop.Error)
-
-			if cause := errors.Unwrap(plmop.Error); cause != nil {
-				raw.Error["Cause"] = fmt.Sprintf("%v", cause)
-			}
-		}
-	}
-
-	return json.Marshal(&raw)
-}
-
-// OperationType enumerates the types of operations we can perform on a prefix list.
-// This requires enumer: go get github.com/alvaroloes/enumer
-type OperationType uint
-
-//go:generate enumer -json -type=OperationType
-
-const (
-	// OpNoModifyPrefixList indicates that no modification to an existing prefix list was required.
-	// ExistingPrefixListID will contain the prefix list id that was considered; NewPrefixListID will be empty.
-	OpNoModifyPrefixList OperationType = iota
-
-	// OpCreatePrefixList indicates that an existing prefix list was not found and a new one was created.
-	// ExistingPrefixListID will be empty; NewPrefixListID will contain the prefix list id that was created.
-	OpCreatePrefixList
-
-	// OpUpdatePrefixListEntries indicates that an existing prefix list was found but had entries that needed to be replaced.
-	// ExistingPrefixListID will contain the prefix list id that was modified; NewPrefixListID will be empty.
-	OpUpdatePrefixListEntries
-
-	// OpReplacePrefixList indicates that an existing prefix list was found but had an incompatible configuration.
-	// ExistingPrefixListID will contain the prefix list id that was deleted; NewPrefixListID will contain the prefix list id that
-	// was created in its place.
-	OpReplacePrefixList
-
-	// OpPrefixListQueryFailedError indicates that an error occurred when querying attributes on an existing prefix list.
-	// Error will be populated with the error that occurred. ExistingPrefixListID will contain the prefix list id that could
-	// not be queried (if any).
-	OpPrefixListQueryFailedError
-
-	// OpPrefixListCreateFailedError indicates that an error occurred when trying to create a new prefix list.
-	// Error will be populated with the error that occurred. ExistingPrefixListID and NewPrefixListID will be empty.
-	OpPrefixListCreateFailedError
-
-	// OpPrefixListDeleteFailedError indicates that an error occurred when trying to delete an existing prefix list.
-	// Error will be populated with the error that occurred. ExistingPrefixListID will contain the prefix list id that failed
-	// to delete.
-	OpPrefixListDeleteFailedError
-
-	// OpPrefixListUpdateFailedError indicates that an error occurred when trying to modify an existing prefix list.
-	// Error will be populated with the error that occurred. ExistingPrefixListID will contain the prefix list id that could
-	// not be modified.
-	OpPrefixListUpdateFailedError
-
-	// OpUpdateSecurityGroupIngress indicates that a security group had ingress rules updated to point to a new prefix list.
-	OpUpdateSecurityGroupIngress
-
-	// OpUpdateSecurityGroupEgress indicates that a security group had egress rules updated to point to a new prefix list.
-	OpUpdateSecurityGroupEgress
-
-	// OpSecurityGroupQueryFailedError indicates that a query on security groups failed.
-	// Error will be populated with the error that occurred. ExistingPrefixListID will contain the prefix list id that contained
-	// referenced security groups.
-	OpSecurityGroupQueryFailedError
-
-	// OpSecurityGroupUpdateFailedError indicates that a security group could not be updated.
-	// Error will be populated with the error that occurred. ExistingPrefixListID will contain the prefix list id that contained
-	// referenced security group, and SecurityGroupID will contain the security group id that failed to update.
-	OpSecurityGroupUpdateFailedError
-
-	// OpNoModifySSMParameterValue indicates that an SSM parameter was up-to-date.
-	// SSMParameterName will contain the name of the parameter that was queried but left intact.
-	OpNoModifySSMParameterValue
-
-	// OpSSMParameterCreated indicates that an SSM parameter was created.
-	// SSMParameterName will contain the name of the parameter that was created.
-	OpSSMParameterCreated
-
-	// OpSSMParameterValueUpdated indicates that an SSM parameter value was updated.
-	// SSMParameterName will contain the name of the parameter that was updated.
-	OpSSMParameterValueUpdated
-
-	// OpNoModifySSMParameterTags indicates that an SSM parameter's tags were up-to-date.
-	// SSMParameterName will contain the name of the parameter that was queried but left intact.
-	OpNoModifySSMParameterTags
-
-	// OpSSMParameterTagsUpdated indicates that an SSM parameter had tags added or updated.
-	// SSMParameterName will contain the name of the parameter that was updated.
-	OpSSMParameterTagsUpdated
-
-	// OpSSMQueryFailedError indicates that one or more SSM parameters could not be queried.
-	// Error will be populated with the error that occurred.
-	OpSSMQueryFailedError
-
-	// OpSSMParameterCreateFailedError indicates that an SSM parameter could not be created.
-	// Error will be populated with the error that occurred. SSMParameterName will contain the name of the parameter that failed
-	// to update.
-	OpSSMParameterCreateFailedError
-
-	// OpSSMParameterValueUpdateFailedError indicates that an SSM parameter value could not be updated.
-	// Error will be populated with the error that occurred. SSMParameterName will contain the name of the parameter that failed
-	// to update.
-	OpSSMParameterValueUpdateFailedError
-
-	// OpSSMParameterTagsUpdateFailedError indicates that an SSM parameter could not have its tags updated.
-	// Error will be populated with the error that occurred. SSMParameterName will contain the name of the parameter that failed
-	// to update.
-	OpSSMParameterTagsUpdateFailedError
-)
-
-// MakeEC2Filter creates an EC2 filter specification with the specified key and values
-func MakeEC2Filter(name string, values ...string) *ec2.Filter {
-	filterValues := make([]*string, len(values))
-	for i, value := range values {
-		filterValues[i] = aws.String(value)
-	}
-
-	return &ec2.Filter{Name: aws.String(name), Values: filterValues}
-}
-
-// MakeEC2Tags converts a TagMap to an array of EC2 Tags.
-func MakeEC2Tags(tagMap TagMap) []*ec2.Tag {
-	result := make([]*ec2.Tag, 0, len(tagMap))
-	for key, value := range tagMap {
-		result = append(result, &ec2.Tag{Key: aws.String(key), Value: aws.String(value)})
-	}
-	return result
-}
-
-// MakeEC2TagSpec converts a TagMap to a tag specification applied to a single resource.
-func MakeEC2TagSpec(tagMap TagMap, resourceType *string) []*ec2.TagSpecification {
-	tagSpec := ec2.TagSpecification{ResourceType: resourceType, Tags: MakeEC2Tags(tagMap)}
-	return []*ec2.TagSpecification{&tagSpec}
-}
-
-// EC2ClientKeyType is a context key structure identifying an ec2iface.EC2API to use when making API calls (for testing).
-type EC2ClientKeyType struct{}
-
-// SSMClientKeyType is a context key structure identifying an ssmiface.SSMAPI to use when making API calls (for testing).
-type SSMClientKeyType struct{}
-
-// STSClientKeyType is a context key structure identifying an stsiface.STSAPI to use when making API calls (for testing).
-type STSClientKeyType struct{}
-
-// CompareIPNets compares two IP networks, ordering them first by IP address, then by prefix.
-//
-// This returns -1 if a < b, +1 if a > b, and 0 if a == b.
-func CompareIPNets(a, b *net.IPNet) int {
-	ipCompare := bytes.Compare(a.IP, b.IP)
-	if ipCompare != 0 {
-		return ipCompare
-	}
-
-	return bytes.Compare(a.Mask, b.Mask)
-}
-
-// SortIPNets sorts a slice of net.IPNet objects and removes any duplicates found.
-func SortIPNets(nets []*net.IPNet) {
-	sort.Slice(nets, func(i, j int) bool { return CompareIPNets(nets[i], nets[j]) < 0 })
-}
-
-// AggregateNetworks finds the smallest set of prefixes that encompasses a slice of IPNets.
-//
-// This is loosely based on the Python ipaddress.collapse_addresses() implementation in Python 3.8.
-func AggregateNetworks(nets []*net.IPNet) []*net.IPNet {
-	SortIPNets(nets)
-
-	// toConsider is a list of the networks to consider for merging
-	toConsider := nets
-
-	// incompleteSupernets is a map of supernet CIDRs to the first subnet seen in the supernet
-	incompleteSupernets := make(map[string]*net.IPNet)
-
-	for len(toConsider) > 0 {
-		// The next round of toConsider nets -- taken from any supernets we generate here.
-		nextToConsider := make([]*net.IPNet, 0)
-
-		// Go over our current list of toConsider nets
-		for _, candidate := range toConsider {
-			// Is the candidate the all-zero network?
-			if maskSize, _ := candidate.Mask.Size(); maskSize == 0 {
-				// Yes; we're done. The entire Internet is in the aggregation
-				return []*net.IPNet{candidate}
-			}
-
-			supernet := GetSupernet(candidate)
-			supernetStr := supernet.String()
-
-			// Is the supernet in our incomplete list?
-			existing, found := incompleteSupernets[supernetStr]
-			if !found {
-				// Nope; create the supernet and mark this candidate for inclusion
-				incompleteSupernets[supernetStr] = candidate
-			} else if !existing.IP.Equal(candidate.IP) {
-				// We needed to make sure the existing net isn't a duplicate of this net.
-				// This completes the supernet -- remove it from the incomplete list and add it to the nextToConsider
-				nextToConsider = append(nextToConsider, supernet)
-				delete(incompleteSupernets, supernetStr)
-			}
-		}
-
-		toConsider = nextToConsider
-	}
-
-	result := make([]*net.IPNet, 0, len(incompleteSupernets))
-	var lastEntry *net.IPNet
-
-	// We add each subnet in the incompleteSupernets to the result (not the supernets -- they're incomplete).
-	// While doing so, we make sure we're not including a more specific network from something we've just seen.
-	for _, subnet := range incompleteSupernets {
-		if lastEntry == nil || !lastEntry.Contains(subnet.IP) {
-			result = append(result, subnet)
-			lastEntry = subnet
-		}
-	}
-
-	return result
-}
-
-// GetSupernet returns the network one-mask-size larger than the specified network.
-func GetSupernet(subnet *net.IPNet) *net.IPNet {
-	maskSize, totalSize := subnet.Mask.Size()
-	if maskSize == 0 {
-		// No supernet possible
-		return subnet
-	}
-
-	supernetMask := net.CIDRMask(maskSize-1, totalSize)
-	supernetIP := subnet.IP.Mask(supernetMask)
-	return &net.IPNet{IP: supernetIP, Mask: supernetMask}
 }

@@ -88,7 +88,7 @@ func (plafm *PrefixListAddressFamilyManager) filterAndAggregatePrefixes(filters 
 
 	if len(filteredPrefixes) == 0 {
 		log.Printf("No prefixes returned for filters: %v", filters)
-		return fmt.Errorf("No prefixes returned for filters")
+		return nil
 	}
 
 	log.Printf("Filtered prefixes: %v", filteredPrefixes)
@@ -114,8 +114,8 @@ func (plafm *PrefixListAddressFamilyManager) filterAndAggregatePrefixes(filters 
 
 // filterMatches indicates whether the specified filter matches the given prefix
 func filterMatches(filter *IPRangesFilter, prefix IPPrefix) bool {
-	if filter.IPAddressType != IPAddressTypeAll && filter.IPAddressType != prefix.GetAddressType() {
-		log.Printf("Filter %v rejects prefix %v: IPAddressType mismatch", filter, prefix)
+	if filter.AddressFamily != AddressFamilyAll && filter.AddressFamily != prefix.GetAddressType() {
+		log.Printf("Filter %v rejects prefix %v: AddressFamily mismatch", filter, prefix)
 		return false
 	}
 

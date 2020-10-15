@@ -13,6 +13,8 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
+	"github.com/aws/aws-sdk-go/service/sns"
+	"github.com/aws/aws-sdk-go/service/sns/snsiface"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 	"github.com/aws/aws-sdk-go/service/sts"
@@ -27,14 +29,17 @@ type PrefixListManager struct {
 	// partition is the AWS partition we're operating in.
 	partition string
 
-	// accountID is the 12-digit account identifier for this account
+	// accountID is the 12-digit account identifier for this account.
 	accountID string
 
-	// ec2 is a handle to the EC2 service.
+	// ec2 is a handle to the AWS EC2 (Elasitc Compute Cloud) service.
 	ec2 ec2iface.EC2API
 
-	// ssm is a handle to the SSM service
+	// ssm is a handle to the AWS SSM ((Simple) Systems Manager) service.
 	ssm ssmiface.SSMAPI
+
+	// sns is a handle to the SNS (Simple Notification Service) service.
+	sns snsiface.SNSAPI
 
 	// request is the incoming request we're handling
 	request *ManageAWSPrefixListsRequest
@@ -60,6 +65,7 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 	var ec2Client ec2iface.EC2API
 	var ssmClient ssmiface.SSMAPI
 	var stsClient stsiface.STSAPI
+	var snsClient snsiface.SNSAPI
 
 	// Retrieve interfaces from the context if they're present (for testing).
 	if ec2Client, present = ctx.Value(EC2ClientKey).(ec2iface.EC2API); !present {
@@ -74,8 +80,13 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 		stsClient = sts.New(awsSession)
 	}
 
+	if snsClient, present = ctx.Value(SNSClientKey).(snsiface.SNSAPI); !present {
+		snsClient = sns.New(awsSession)
+	}
+
 	plm.ec2 = ec2Client
 	plm.ssm = ssmClient
+	plm.sns = snsClient
 
 	// Figure out our account id and partition
 	callerID, err := stsClient.GetCallerIdentity(&sts.GetCallerIdentityInput{})
@@ -150,6 +161,11 @@ func (plm *PrefixListManager) Process() ([]PrefixListManagementOp, error) {
 		return nil, err
 	}
 
+	if len(plm.ipv4.keptPrefixes) == 0 && len(plm.ipv6.keptPrefixes) == 0 {
+		log.Printf("Filters returned no prefixes")
+		return nil, fmt.Errorf("Filters returned no prefixes")
+	}
+
 	// Get the prefix list names -- this may fail, so we want to capture any errors before we make modifications to AWS.
 	if err := plm.ipv4.generatePrefixListNames(plm.request.PrefixListNameBase, plm.request.PrefixListNameTemplate); err != nil {
 		return nil, err
@@ -179,5 +195,13 @@ func (plm *PrefixListManager) Process() ([]PrefixListManagementOp, error) {
 	ops = append(ops, plm.ipv6.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv6Parameters, plm.request.SSMParameters.Tags,
 		plm.request.SSMParameters.Tier)...)
 
+	// Create notifications for SNS
+	plm.NotifySNS(ops)
+
 	return ops, nil
+}
+
+// NotifySNS publishes a notification to SNS from the operations performed.
+func (plm *PrefixListManager) NotifySNS(ops []PrefixListManagementOp) {
+
 }
