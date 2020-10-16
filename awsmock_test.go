@@ -270,6 +270,131 @@ sgLoop:
 	return nil
 }
 
+func (m *EC2Mock) GetManagedPrefixListEntriesPages(input *ec2.GetManagedPrefixListEntriesInput, iter func(*ec2.GetManagedPrefixListEntriesOutput, bool) bool) error {
+	if input.PrefixListId == nil {
+		return fmt.Errorf("PrefixListId must be specified")
+	}
+
+	prefixListID := *input.PrefixListId
+
+	startAt := int64(0)
+	if input.NextToken != nil {
+		var err error
+		startAt, err = strconv.ParseInt(*input.NextToken, 10, 64)
+		if err != nil {
+			return fmt.Errorf("Invalid NextToken value")
+		}
+	}
+
+	maxResults := int64(100)
+	if input.MaxResults != nil {
+		maxResults = aws.Int64Value(input.MaxResults)
+		if maxResults <= 0 || maxResults > 100 {
+			return fmt.Errorf("MaxResults must be between 1 and 100 inclusive")
+		}
+	}
+
+	mpl, present := m.managedPrefixLists[prefixListID]
+	if !present {
+		return fmt.Errorf("Managed prefix list with PrefixListId %v not found", prefixListID)
+	}
+
+	output := ec2.GetManagedPrefixListEntriesOutput{}
+	nEntries := int64(len(mpl.Entries))
+
+	for i := startAt; i < nEntries; i += maxResults {
+		end := i + maxResults
+		lastPage := false
+
+		if end >= nEntries {
+			end = nEntries
+			lastPage = true
+		}
+
+		output.Entries = make([]*ec2.PrefixListEntry, 0, maxResults)
+
+		for _, entry := range mpl.Entries[i:end] {
+			output.Entries = append(output.Entries, &ec2.PrefixListEntry{
+				Cidr: CopyAWSString(entry.Cidr), Description: CopyAWSString(entry.Description),
+			})
+		}
+
+		if !iter(&output, lastPage) {
+			break
+		}
+	}
+
+	return nil
+}
+
+func (m *EC2Mock) ModifyManagedPrefixList(input *ec2.ModifyManagedPrefixListInput) (*ec2.ModifyManagedPrefixListOutput, error) {
+	if input.PrefixListId == nil {
+		return nil, fmt.Errorf("PrefixListId must be specified")
+	}
+
+	prefixListID := *input.PrefixListId
+	mpl, present := m.managedPrefixLists[prefixListID]
+	if !present {
+		return nil, fmt.Errorf("Managed prefix list with PrefixListId %v not found", prefixListID)
+	}
+
+	newEntries := make([]*ec2.PrefixListEntry, len(mpl.Entries), len(mpl.Entries)+len(input.AddEntries))
+	for i := 0; i < len(mpl.Entries); i++ {
+		newEntries[i] = mpl.Entries[i]
+	}
+
+	for index, remoteEntry := range input.RemoveEntries {
+		if remoteEntry.Cidr == nil {
+			return nil, fmt.Errorf("RemoveEntries contains a null Cidr at entry %d", index)
+		}
+
+		cidr := *remoteEntry.Cidr
+		found := false
+
+		for i := 0; i < len(newEntries); i++ {
+			if aws.StringValue(newEntries[i].Cidr) == cidr {
+				// Found it. Remove it from the new entries slice.
+				if i < len(newEntries)-1 {
+					newEntries = append(newEntries[0:i], newEntries[i+1:]...)
+				} else {
+					newEntries = newEntries[0:i]
+				}
+
+				found = true
+				break
+			}
+		}
+
+		if !found {
+			return nil, fmt.Errorf("Managed prefix list %v does not contain entry with CIDR %v to remove", prefixListID, cidr)
+		}
+	}
+
+	for index, addEntry := range input.AddEntries {
+		if addEntry.Cidr == nil {
+			return nil, fmt.Errorf("AddEntries contains a null Cidr at entry %d", index)
+		}
+		newEntries = append(newEntries, &ec2.PrefixListEntry{Cidr: CopyAWSString(addEntry.Cidr)})
+	}
+
+	if int64(len(newEntries)) > aws.Int64Value(mpl.PrefixList.MaxEntries) {
+		return nil, fmt.Errorf("Managed prefix list %v additions would exceed MaxEntries: new length=%d, MaxEntries=%d",
+			prefixListID, len(newEntries), aws.Int64Value(mpl.PrefixList.MaxEntries))
+	}
+
+	if input.PrefixListName != nil {
+		if *input.PrefixListName == "" {
+			return nil, fmt.Errorf("PrefixListName cannot be empty")
+		}
+
+		mpl.PrefixList.PrefixListName = CopyAWSString(input.PrefixListName)
+	}
+	mpl.Entries = newEntries
+
+	output := ec2.ModifyManagedPrefixListOutput{PrefixList: &mpl.PrefixList}
+	return &output, nil
+}
+
 func (m *EC2Mock) DescribeSecurityGroupsPages(input *ec2.DescribeSecurityGroupsInput, iter func(*ec2.DescribeSecurityGroupsOutput, bool) bool) error {
 	if len(input.Filters) > 0 {
 		return fmt.Errorf("Security group filters are not supported")
@@ -384,6 +509,10 @@ func (m *SSMMock) PutParameter(input *ssm.PutParameterInput) (*ssm.PutParameterO
 			return nil, fmt.Errorf("Parameter present but Overwrite not specified")
 		}
 
+		if len(input.Tags) != 0 {
+			return nil, fmt.Errorf("Cannot specify Tags when modifying a parameter; use AddTagsToResource instead")
+		}
+
 		version = aws.Int64Value(current.Version) + 1
 	}
 
@@ -438,6 +567,73 @@ func (m *SSMMock) ListTagsForResource(input *ssm.ListTagsForResourceInput) (*ssm
 		output.TagList = append(output.TagList, &ssm.Tag{Key: CopyAWSString(tag.Key), Value: CopyAWSString(tag.Value)})
 	}
 
+	return &output, nil
+}
+
+func (m *SSMMock) AddTagsToResource(input *ssm.AddTagsToResourceInput) (*ssm.AddTagsToResourceOutput, error) {
+	if input.ResourceId == nil {
+		return nil, fmt.Errorf("ResourceId must be specified")
+	}
+	resourceID := *input.ResourceId
+
+	if input.ResourceType == nil {
+		return nil, fmt.Errorf("ResourceType must be specified")
+	}
+	resourceType := *input.ResourceType
+
+	if resourceType != "Parameter" {
+		return nil, fmt.Errorf("ResourceType %v is not supported", resourceType)
+	}
+
+	if _, present := m.parameters[resourceID]; !present {
+		return nil, fmt.Errorf("Parameter with name %#v not found", resourceID)
+	}
+
+	if _, present := m.parameterTags[resourceID]; !present {
+		m.parameterTags[resourceID] = make([]*ssm.Tag, 0, len(input.Tags))
+	}
+
+	for i, tag := range input.Tags {
+		if tag.Key == nil {
+			return nil, fmt.Errorf("Tag key %d cannot be null", i)
+		}
+
+		key := *tag.Key
+		if key == "" {
+			return nil, fmt.Errorf("Tag key %d cannot be empty", i)
+		}
+
+		if tag.Value == nil {
+			for j := 0; j < len(m.parameterTags[resourceID]); j++ {
+				if key == *m.parameterTags[resourceID][j].Key {
+					// Found the tag to delete.
+					if j < len(m.parameterTags[resourceID])-1 {
+						m.parameterTags[resourceID] = append(m.parameterTags[resourceID][:i], m.parameterTags[resourceID][i+1:]...)
+					} else {
+						m.parameterTags[resourceID] = m.parameterTags[resourceID][:i]
+					}
+				}
+			}
+		} else {
+			modified := false
+			for _, resourceTag := range m.parameterTags[resourceID] {
+				if key == *resourceTag.Key {
+					// Found the tag to modify
+					resourceTag.Value = CopyAWSString(tag.Value)
+					modified = true
+					break
+				}
+			}
+
+			if !modified {
+				// Need to append this parameter.
+				m.parameterTags[resourceID] = append(m.parameterTags[resourceID], &ssm.Tag{
+					Key: CopyAWSString(tag.Key), Value: CopyAWSString(tag.Value)})
+			}
+		}
+	}
+
+	output := ssm.AddTagsToResourceOutput{}
 	return &output, nil
 }
 

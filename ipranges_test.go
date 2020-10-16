@@ -69,7 +69,7 @@ func StartIPRangesServer(c *testing.T, ipRanges *IPRanges) (*IPRangesServer, err
 	server := http.Server{Handler: handler, ErrorLog: createLoggerFromTesting(c)}
 	go server.Serve(listener)
 
-	return &IPRangesServer{Server: &server, Listener: listener}, nil
+	return &IPRangesServer{Server: &server, Listener: listener, handler: handler}, nil
 }
 
 // GetURL returns the URL to use for fetching the test ip-ranges.json documents.

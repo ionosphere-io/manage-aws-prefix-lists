@@ -130,7 +130,7 @@ func filterMatches(filter *IPRangesFilter, prefix IPPrefix) bool {
 	}
 
 	if !filter.NetworkBorderGroupRegex.MatchString(prefix.GetNetworkBorderGroup()) {
-		log.Printf("Filter %v rejects prefix %v: NetworkBorderGroup mismstach", filter, prefix)
+		log.Printf("Filter %v rejects prefix %v: NetworkBorderGroup mismatch", filter, prefix)
 		return false
 	}
 

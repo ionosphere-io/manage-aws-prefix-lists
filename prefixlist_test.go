@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"testing"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
 type testingLogger struct {
@@ -295,7 +297,36 @@ func TestBasicPrefixList(c *testing.T) {
 	}
 }
 
-func TestIPv4OnlyPrefixList(c *testing.T) {
+func comparePrefixes(prefixes []*ec2.PrefixListEntry, expected []string) (bool, string) {
+	actual := make([]string, 0, len(prefixes))
+	foundInExpected := make(map[string]bool)
+
+	for _, prefix := range expected {
+		foundInExpected[prefix] = false
+	}
+
+	for _, prefix := range prefixes {
+		actual = append(actual, *prefix.Cidr)
+	}
+
+	for _, prefix := range actual {
+		if _, present := foundInExpected[prefix]; !present {
+			return false, fmt.Sprintf("Prefix found that wasn't expected: %#v; expected=%#v, actual=%#v", prefix, expected, actual)
+		}
+
+		foundInExpected[prefix] = true
+	}
+
+	for prefix, found := range foundInExpected {
+		if !found {
+			return false, fmt.Sprintf("Prefix missing that was expected: %#v; expected=%#v, actual=%#v", prefix, expected, actual)
+		}
+	}
+
+	return true, ""
+}
+
+func TestIPv4ReplacedRangesIPv4IPv6PrefixList(c *testing.T) {
 	prefixesIPv4 := []IPv4Prefix{
 		{IPPrefix: "10.20.0.0/16", Region: "us-west-2", Service: "EC2", NetworkBorderGroup: "us-west-2"},
 		{IPPrefix: "10.21.0.0/16", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
@@ -310,11 +341,16 @@ func TestIPv4OnlyPrefixList(c *testing.T) {
 		{IPv6Prefix: "fc00:21::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
 		{IPv6Prefix: "fc00:22:0:0::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
 		{IPv6Prefix: "fc00:22:0:1::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
-		{IPv6Prefix: "fc00:22:0:2:0::/65", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
-		{IPv6Prefix: "fc00:22:0:2:8000::/66", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
-		{IPv6Prefix: "fc00:22:0:2:c000::/66", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
-		{IPv6Prefix: "fc00:22:0:3::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:2::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:3::/65", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:3:8000::/65", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
 	}
+
+	// Expected aggregation results
+	ipv4ExpectedAgg1 := []string{"10.21.0.0/16", "192.168.0.0/22"}
+	ipv4ExpectedAgg2 := []string{"10.21.0.0/16", "192.168.0.0/23", "192.168.2.0/24", "192.168.3.128/25"}
+	ipv6ExpectedAgg2 := []string{"fc00:21::/64", "fc00:22::/63", "fc00:22:0:2::/64", "fc00:22:0:3:8000::/65"}
+
 	ipRanges := IPRanges{SyncToken: "1", CreateDate: "2000-01-01-00-00-00", Prefixes: prefixesIPv4, IPv6Prefixes: prefixesIPv6}
 	server, err := StartIPRangesServer(c, &ipRanges)
 	if err != nil {
@@ -331,11 +367,13 @@ func TestIPv4OnlyPrefixList(c *testing.T) {
 	req := ManageAWSPrefixListsRequest{}
 	if err = json.Unmarshal([]byte(`{
 	"PrefixListNameBase": "cloudfront",
+	"PrefixListTags": [{"Key": "Service", "Value": "Cloudfront"}],
 	"Filters": [
 		{"Service": "CLOUDFRONT", "AddressFamily": "IPv4"}
 	],
 	"SSMParameters": {
-		"IPv4Parameters": ["SSMParamIPv4"]
+		"IPv4Parameters": ["SSMParamIPv4"],
+		"Tags": {"Service": "Cloudfront"}
 	}
 }`), &req); err != nil {
 		c.Fatalf("Failed to create request: %v", err)
@@ -354,12 +392,15 @@ func TestIPv4OnlyPrefixList(c *testing.T) {
 		c.Errorf("Failed to unmarshal response as JSON: %v\n", error)
 	}
 
+	var origIPv4PrefixListID string
+
 	// Make sure aggregation happened as expected
 	if len(ec2Mock.managedPrefixLists) != 1 {
 		c.Errorf("Expected 1 managed prefix list; got %d", len(ec2Mock.managedPrefixLists))
 	} else {
 		var mpl *managedPrefixListAndEntries
-		for _, item := range ec2Mock.managedPrefixLists {
+		for prefixListID, item := range ec2Mock.managedPrefixLists {
+			origIPv4PrefixListID = prefixListID
 			mpl = item
 			break
 		}
@@ -367,12 +408,9 @@ func TestIPv4OnlyPrefixList(c *testing.T) {
 		if aws.StringValue(mpl.PrefixList.AddressFamily) != "IPv4" {
 			c.Errorf("Expected prefix list to be an IPv4 prefix list")
 		} else {
-			if len(mpl.Entries) != 2 {
-				c.Errorf("Expected 2 CIDRs in IPv4 range: %v", mpl.Entries)
-			} else {
-				if aws.StringValue(mpl.Entries[1].Cidr) != "192.168.0.0/22" {
-					c.Errorf("Expected aggregation to result in 192.168.0.0/22: %v", mpl.Entries[1].Cidr)
-				}
+			ok, msg := comparePrefixes(mpl.Entries, ipv4ExpectedAgg1)
+			if !ok {
+				c.Errorf("Mismatch in case 1 prefixes: %s", msg)
 			}
 		}
 
@@ -390,6 +428,104 @@ func TestIPv4OnlyPrefixList(c *testing.T) {
 			if param != nil && aws.StringValue(param.Value) != aws.StringValue(mpl.PrefixList.PrefixListId) {
 				c.Errorf("Expected SSM paramteter value to match the prefix list id: expected %v, got %v",
 					aws.StringValue(mpl.PrefixList.PrefixListId), aws.StringValue(param.Value))
+			}
+		}
+	}
+
+	// Update the prefixes -- remove one needed for aggregation.
+	prefixesIPv4 = append(prefixesIPv4[0:5], prefixesIPv4[6:]...)
+	prefixesIPv6 = append(prefixesIPv6[0:5], prefixesIPv6[6:]...)
+	ipRanges.Prefixes = prefixesIPv4
+	ipRanges.IPv6Prefixes = prefixesIPv6
+
+	server.UpdateIPRanges(&ipRanges)
+
+	req.Filters[0].AddressFamily = AddressFamilyAll
+	req.SSMParameters.IPv6Parameters = []string{"SSMParamIPv6"}
+	req.SSMParameters.Tags["Hello"] = "World"
+
+	response, error = HandleLambdaRequest(ctx, req)
+	if error != nil {
+		c.Errorf("Failed to handle request: %v\n", error)
+		return
+	}
+	responseDecoded = make(map[string]interface{})
+	error = json.Unmarshal([]byte(response), &responseDecoded)
+	if error != nil {
+		c.Errorf("Failed to unmarshal response as JSON: %v\n", error)
+	}
+
+	// Make sure aggregation happened as expected
+	if len(ec2Mock.managedPrefixLists) != 2 {
+		c.Errorf("Expected 2 managed prefix list; got %d", len(ec2Mock.managedPrefixLists))
+	} else {
+		var ipv4PrefixListID string
+		var ipv6PrefixListID string
+
+		for prefixListID, mpl := range ec2Mock.managedPrefixLists {
+			prefixListAddressFamily := aws.StringValue(mpl.PrefixList.AddressFamily)
+			if prefixListAddressFamily == "IPv4" {
+				ipv4PrefixListID = prefixListID
+
+				if ipv4PrefixListID != origIPv4PrefixListID {
+					c.Errorf("Expected prefix list id for IPv4 to remain the same: orig=%v new=%v", origIPv4PrefixListID, ipv4PrefixListID)
+				}
+
+				if ok, msg := comparePrefixes(mpl.Entries, ipv4ExpectedAgg2); !ok {
+					c.Errorf("Mismatch in case 2 IPv4 prefixes: %s", msg)
+				}
+			} else if prefixListAddressFamily == "IPv6" {
+				ipv6PrefixListID = prefixListID
+
+				if ok, msg := comparePrefixes(mpl.Entries, ipv6ExpectedAgg2); !ok {
+					c.Errorf("Mismatch in case 2 IPv6 prefixes: %s", msg)
+				}
+			}
+		}
+
+		if ipv4PrefixListID == "" {
+			c.Errorf("Did not see IPv4 prefix list")
+		}
+		if ipv6PrefixListID == "" {
+			c.Errorf("Did not see IPv6 prefix list")
+		}
+
+		if ipv4PrefixListID != "" && ipv6PrefixListID != "" {
+			// Make sure SSM contains the expected parameters.
+			if len(ssmMock.parameters) != 2 {
+				c.Errorf("Expected SSM to contain 2 parameters instead of %d", len(ssmMock.parameters))
+			} else {
+				param := ssmMock.parameters["SSMParamIPv4"]
+				if param == nil {
+					c.Errorf("SSM parameter SSMParamIPv4 not found")
+				} else {
+					if aws.StringValue(param.Name) != "SSMParamIPv4" {
+						c.Errorf("Expected SSM paramter name to be SSMParamIPv4: %v", aws.StringValue(param.Name))
+					}
+					if aws.StringValue(param.Type) != "StringList" {
+						c.Errorf("Expected SSM parameter type to be StringList: %v", aws.StringValue(param.Type))
+					}
+					if aws.StringValue(param.Value) != ipv4PrefixListID {
+						c.Errorf("Expected SSM paramteter value to match the prefix list id: expected %v, got %v",
+							ipv4PrefixListID, aws.StringValue(param.Value))
+					}
+				}
+
+				param = ssmMock.parameters["SSMParamIPv6"]
+				if param == nil {
+					c.Errorf("SSM parameter SSMParamIPv6 not found")
+				} else {
+					if aws.StringValue(param.Name) != "SSMParamIPv6" {
+						c.Errorf("Expected SSM paramter name to be SSMParamIPv6: %v", aws.StringValue(param.Name))
+					}
+					if aws.StringValue(param.Type) != "StringList" {
+						c.Errorf("Expected SSM parameter type to be StringList: %v", aws.StringValue(param.Type))
+					}
+					if aws.StringValue(param.Value) != ipv6PrefixListID {
+						c.Errorf("Expected SSM paramteter value to match the prefix list id: expected %v, got %v",
+							ipv6PrefixListID, aws.StringValue(param.Value))
+					}
+				}
 			}
 		}
 	}
