@@ -178,3 +178,19 @@ func GetSupernet(subnet *net.IPNet) *net.IPNet {
 	supernetIP := subnet.IP.Mask(supernetMask)
 	return &net.IPNet{IP: supernetIP, Mask: supernetMask}
 }
+
+// CopyAWSString copies an AWS-style string from one pointer to another.
+func CopyAWSString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	return aws.String(aws.StringValue(value))
+}
+
+// CopyAWSInt64 copies an AWS-style int64 from one pointer to another.
+func CopyAWSInt64(value *int64) *int64 {
+	if value == nil {
+		return nil
+	}
+	return aws.Int64(aws.Int64Value(value))
+}
