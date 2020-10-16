@@ -324,8 +324,9 @@ func TestIPv4OnlyPrefixList(c *testing.T) {
 	defer server.Shutdown()
 
 	ec2Mock := &EC2Mock{}
+	ssmMock := &SSMMock{}
 	ctx := context.WithValue(context.Background(), EC2ClientKey, ec2Mock)
-	ctx = context.WithValue(ctx, SSMClientKey, &SSMMock{})
+	ctx = context.WithValue(ctx, SSMClientKey, ssmMock)
 	ctx = context.WithValue(ctx, STSClientKey, &STSMock{})
 	req := ManageAWSPrefixListsRequest{}
 	if err = json.Unmarshal([]byte(`{
@@ -357,7 +358,12 @@ func TestIPv4OnlyPrefixList(c *testing.T) {
 	if len(ec2Mock.managedPrefixLists) != 1 {
 		c.Errorf("Expected 1 managed prefix list; got %d", len(ec2Mock.managedPrefixLists))
 	} else {
-		mpl := ec2Mock.managedPrefixLists[0]
+		var mpl *managedPrefixListAndEntries
+		for _, item := range ec2Mock.managedPrefixLists {
+			mpl = item
+			break
+		}
+
 		if aws.StringValue(mpl.PrefixList.AddressFamily) != "IPv4" {
 			c.Errorf("Expected prefix list to be an IPv4 prefix list")
 		} else {
@@ -368,6 +374,172 @@ func TestIPv4OnlyPrefixList(c *testing.T) {
 					c.Errorf("Expected aggregation to result in 192.168.0.0/22: %v", mpl.Entries[1].Cidr)
 				}
 			}
+		}
+
+		// Make sure SSM contains the expected parameters.
+		if len(ssmMock.parameters) != 1 {
+			c.Errorf("Expected SSM to contain 1 parameter instead of %d", len(ssmMock.parameters))
+		} else {
+			param := ssmMock.parameters["SSMParamIPv4"]
+			if param == nil || aws.StringValue(param.Name) != "SSMParamIPv4" {
+				c.Errorf("Expected SSM paramter name to be SSMParamIPv4: %v", aws.StringValue(param.Name))
+			}
+			if param != nil && aws.StringValue(param.Type) != "StringList" {
+				c.Errorf("Expected SSM parameter type to be StringList: %v", aws.StringValue(param.Type))
+			}
+			if param != nil && aws.StringValue(param.Value) != aws.StringValue(mpl.PrefixList.PrefixListId) {
+				c.Errorf("Expected SSM paramteter value to match the prefix list id: expected %v, got %v",
+					aws.StringValue(mpl.PrefixList.PrefixListId), aws.StringValue(param.Value))
+			}
+		}
+	}
+}
+
+func TestReplacePrefixList(c *testing.T) {
+	prefixesIPv4 := []IPv4Prefix{
+		{IPPrefix: "10.20.0.0/16", Region: "us-west-2", Service: "EC2", NetworkBorderGroup: "us-west-2"},
+		{IPPrefix: "10.21.0.0/16", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPPrefix: "192.168.0.0/24", Region: "us-west-1", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-1"},
+		{IPPrefix: "192.168.1.0/24", Region: "us-west-1", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-1"},
+		{IPPrefix: "192.168.2.0/24", Region: "us-west-1", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-1"},
+		{IPPrefix: "192.168.3.0/25", Region: "us-west-1", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-1"},
+		{IPPrefix: "192.168.3.128/25", Region: "us-west-1", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-1"},
+	}
+	prefixesIPv6 := []IPv6Prefix{
+		{IPv6Prefix: "fc00:20::/64", Region: "us-west-2", Service: "EC2", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:21::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:0::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:1::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:2:0::/65", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:2:8000::/66", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:2:c000::/66", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22:0:3::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+	}
+	ipRanges := IPRanges{SyncToken: "1", CreateDate: "2000-01-01-00-00-00", Prefixes: prefixesIPv4, IPv6Prefixes: prefixesIPv6}
+	server, err := StartIPRangesServer(c, &ipRanges)
+	if err != nil {
+		c.Fatalf("Unable to start IP ranges server: %v", err)
+		return
+	}
+	defer server.Shutdown()
+
+	ec2Mock := &EC2Mock{}
+	ssmMock := &SSMMock{}
+	ctx := context.WithValue(context.Background(), EC2ClientKey, ec2Mock)
+	ctx = context.WithValue(ctx, SSMClientKey, ssmMock)
+	ctx = context.WithValue(ctx, STSClientKey, &STSMock{})
+	req := ManageAWSPrefixListsRequest{}
+	if err = json.Unmarshal([]byte(`{
+	"PrefixListNameBase": "cloudfront",
+	"Filters": [
+		{"Service": "CLOUDFRONT", "AddressFamily": "IPv4"}
+	],
+	"SSMParameters": {
+		"IPv4Parameters": ["SSMParamIPv4"]
+	},
+	"GroupSize": 10
+}`), &req); err != nil {
+		c.Fatalf("Failed to create request: %v", err)
+	}
+
+	req.IPRangesURL = server.GetURL()
+
+	response, error := HandleLambdaRequest(ctx, req)
+	if error != nil {
+		c.Errorf("Failed to handle request: %v\n", error)
+		return
+	}
+	responseDecoded := make(map[string]interface{})
+	error = json.Unmarshal([]byte(response), &responseDecoded)
+	if error != nil {
+		c.Errorf("Failed to unmarshal response as JSON: %v\n", error)
+		return
+	}
+
+	var origPrefixListID string
+	// Make sure aggregation happened as expected
+	if len(ec2Mock.managedPrefixLists) != 1 {
+		c.Errorf("Expected 1 managed prefix list; got %d", len(ec2Mock.managedPrefixLists))
+		return
+	}
+
+	var mpl *managedPrefixListAndEntries
+	for _, item := range ec2Mock.managedPrefixLists {
+		mpl = item
+		break
+	}
+
+	origPrefixListID = *mpl.PrefixList.PrefixListId
+	if aws.Int64Value(mpl.PrefixList.MaxEntries) != 10 {
+		c.Errorf("Expected original prefix list to have a maximum of 10 entries.")
+	}
+
+	// Make sure SSM contains the expected parameters.
+	if len(ssmMock.parameters) != 1 {
+		c.Errorf("Expected SSM to contain 1 parameter instead of %d", len(ssmMock.parameters))
+	} else {
+		param := ssmMock.parameters["SSMParamIPv4"]
+		if param == nil || aws.StringValue(param.Name) != "SSMParamIPv4" {
+			c.Errorf("Expected SSM paramter name to be SSMParamIPv4: %v", aws.StringValue(param.Name))
+		}
+		if param != nil && aws.StringValue(param.Type) != "StringList" {
+			c.Errorf("Expected SSM parameter type to be StringList: %v", aws.StringValue(param.Type))
+		}
+		if param != nil && aws.StringValue(param.Value) != origPrefixListID {
+			c.Errorf("Expected SSM paramteter value to match the prefix list id: expected %v, got %v", origPrefixListID,
+				aws.StringValue(param.Value))
+		}
+	}
+
+	req.GroupSize = 20
+	response, error = HandleLambdaRequest(ctx, req)
+
+	if error != nil {
+		c.Errorf("Failed to handle request: %v\n", error)
+		return
+	}
+	responseDecoded = make(map[string]interface{})
+	error = json.Unmarshal([]byte(response), &responseDecoded)
+	if error != nil {
+		c.Errorf("Failed to unmarshal response as JSON: %v\n", error)
+		return
+	}
+
+	var newPrefixListID string
+	// Make sure aggregation happened as expected
+	if len(ec2Mock.managedPrefixLists) != 1 {
+		c.Errorf("Expected 1 managed prefix list; got %d", len(ec2Mock.managedPrefixLists))
+		return
+	}
+
+	for _, item := range ec2Mock.managedPrefixLists {
+		mpl = item
+		break
+	}
+
+	newPrefixListID = *mpl.PrefixList.PrefixListId
+	if aws.Int64Value(mpl.PrefixList.MaxEntries) != 20 {
+		c.Errorf("Expected new prefix list to have a maximum of 10 entries.")
+	}
+
+	if origPrefixListID == newPrefixListID {
+		c.Errorf("Expected prefix list id to change from %v", origPrefixListID)
+	}
+
+	// Make sure SSM contains the expected parameters.
+	if len(ssmMock.parameters) != 1 {
+		c.Errorf("Expected SSM to contain 1 parameter instead of %d", len(ssmMock.parameters))
+	} else {
+		param := ssmMock.parameters["SSMParamIPv4"]
+		if param == nil || aws.StringValue(param.Name) != "SSMParamIPv4" {
+			c.Errorf("Expected SSM paramter name to be SSMParamIPv4: %v", aws.StringValue(param.Name))
+		}
+		if param != nil && aws.StringValue(param.Type) != "StringList" {
+			c.Errorf("Expected SSM parameter type to be StringList: %v", aws.StringValue(param.Type))
+		}
+		if param != nil && aws.StringValue(param.Value) != newPrefixListID {
+			c.Errorf("Expected SSM paramteter value to match the prefix list id: expected %v, got %v", newPrefixListID,
+				aws.StringValue(param.Value))
 		}
 	}
 }

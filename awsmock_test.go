@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"math/rand"
+	"strconv"
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
@@ -17,7 +18,8 @@ import (
 type EC2Mock struct {
 	ec2iface.EC2API
 
-	managedPrefixLists []*managedPrefixListAndEntries
+	managedPrefixLists map[string]*managedPrefixListAndEntries
+	securityGroups     map[string]*ec2.SecurityGroup
 }
 
 func (m *EC2Mock) CreateManagedPrefixList(input *ec2.CreateManagedPrefixListInput) (*ec2.CreateManagedPrefixListOutput, error) {
@@ -33,7 +35,9 @@ func (m *EC2Mock) CreateManagedPrefixList(input *ec2.CreateManagedPrefixListInpu
 	var tags []*ec2.Tag
 	for _, tagSpec := range input.TagSpecifications {
 		if aws.StringValue(tagSpec.ResourceType) == "prefix-list" {
-			tags = append(tags, tagSpec.Tags...)
+			for _, tag := range tagSpec.Tags {
+				tags = append(tags, &ec2.Tag{Key: CopyAWSString(tag.Key), Value: CopyAWSString(tag.Value)})
+			}
 		}
 	}
 
@@ -44,10 +48,10 @@ func (m *EC2Mock) CreateManagedPrefixList(input *ec2.CreateManagedPrefixListInpu
 
 	mpl := managedPrefixListAndEntries{
 		PrefixList: ec2.ManagedPrefixList{
-			AddressFamily:  input.AddressFamily,
-			MaxEntries:     input.MaxEntries,
+			AddressFamily:  CopyAWSString(input.AddressFamily),
+			MaxEntries:     CopyAWSInt64(input.MaxEntries),
 			PrefixListArn:  aws.String(fmt.Sprintf("arn:aws:ec2:us-west-2:123456789012:prefix-list/%s", plID)),
-			PrefixListName: input.PrefixListName,
+			PrefixListName: CopyAWSString(input.PrefixListName),
 			PrefixListId:   &plID,
 			State:          aws.String("create-complete"),
 			Tags:           tags,
@@ -56,8 +60,33 @@ func (m *EC2Mock) CreateManagedPrefixList(input *ec2.CreateManagedPrefixListInpu
 		Entries: entries,
 	}
 
-	m.managedPrefixLists = append(m.managedPrefixLists, &mpl)
+	if m.managedPrefixLists == nil {
+		m.managedPrefixLists = make(map[string]*managedPrefixListAndEntries)
+	}
+
+	m.managedPrefixLists[plID] = &mpl
 	return &ec2.CreateManagedPrefixListOutput{PrefixList: &(mpl.PrefixList)}, nil
+}
+
+func (m *EC2Mock) DeleteManagedPrefixList(input *ec2.DeleteManagedPrefixListInput) (*ec2.DeleteManagedPrefixListOutput, error) {
+	if input.PrefixListId == nil {
+		return nil, fmt.Errorf("PrefixListId must be specified")
+	}
+
+	// If the map hasn't been created, go ahead and create it; this will error out when we check for the prefix list.
+	if m.managedPrefixLists == nil {
+		m.managedPrefixLists = make(map[string]*managedPrefixListAndEntries)
+	}
+
+	prefixListID := *input.PrefixListId
+	mpl, present := m.managedPrefixLists[prefixListID]
+	if !present {
+		return nil, fmt.Errorf("Managed prefix list with PrefixListId %v not found", prefixListID)
+	}
+
+	delete(m.managedPrefixLists, prefixListID)
+	output := ec2.DeleteManagedPrefixListOutput{PrefixList: &mpl.PrefixList}
+	return &output, nil
 }
 
 func (m *EC2Mock) DescribeManagedPrefixListsPages(input *ec2.DescribeManagedPrefixListsInput, iter func(*ec2.DescribeManagedPrefixListsOutput, bool) bool) error {
@@ -174,10 +203,131 @@ mplLoop:
 	return nil
 }
 
+func (m *EC2Mock) GetManagedPrefixListAssociationsPages(input *ec2.GetManagedPrefixListAssociationsInput, iter func(*ec2.GetManagedPrefixListAssociationsOutput, bool) bool) error {
+	if input.PrefixListId == nil {
+		return fmt.Errorf("PrefixListId must be specified")
+	}
+	prefixListID := *input.PrefixListId
+	output := ec2.GetManagedPrefixListAssociationsOutput{}
+	startAt := int64(0)
+	if input.NextToken != nil {
+		var err error
+		startAt, err = strconv.ParseInt(*input.NextToken, 10, 64)
+		if err != nil {
+			return fmt.Errorf("Invalid NextToken value")
+		}
+	}
+
+	maxResults := int64(100)
+	if input.MaxResults != nil {
+		maxResults = *input.MaxResults
+		if maxResults <= 0 || maxResults > 100 {
+			return fmt.Errorf("MaxResults must be between 1 and 100, inclusive")
+		}
+	}
+
+	var results []*ec2.PrefixListAssociation
+
+sgLoop:
+	for _, sg := range m.securityGroups {
+		for _, perm := range sg.IpPermissions {
+			for _, sgPrefixListID := range perm.PrefixListIds {
+				if aws.StringValue(sgPrefixListID.PrefixListId) == prefixListID {
+					results = append(results, &ec2.PrefixListAssociation{
+						ResourceId: CopyAWSString(sg.GroupId), ResourceOwner: aws.String("123456789012"),
+					})
+					continue sgLoop
+				}
+			}
+		}
+
+		for _, perm := range sg.IpPermissionsEgress {
+			for _, sgPrefixListID := range perm.PrefixListIds {
+				if aws.StringValue(sgPrefixListID.PrefixListId) == prefixListID {
+					results = append(results, &ec2.PrefixListAssociation{ResourceId: sg.GroupId, ResourceOwner: aws.String("123456789012")})
+					continue sgLoop
+				}
+			}
+		}
+	}
+
+	nResults := int64(len(results))
+	for i := startAt; i < nResults; i += maxResults {
+		end := i + maxResults
+		lastPage := false
+
+		if end >= nResults {
+			end = nResults
+			lastPage = true
+		}
+
+		output.SetPrefixListAssociations(results[i:end])
+		if !iter(&output, lastPage) {
+			break
+		}
+	}
+
+	return nil
+}
+
+func (m *EC2Mock) DescribeSecurityGroupsPages(input *ec2.DescribeSecurityGroupsInput, iter func(*ec2.DescribeSecurityGroupsOutput, bool) bool) error {
+	if len(input.Filters) > 0 {
+		return fmt.Errorf("Security group filters are not supported")
+	}
+
+	output := ec2.DescribeSecurityGroupsOutput{}
+	startAt := int64(0)
+	if input.NextToken != nil {
+		var err error
+		startAt, err = strconv.ParseInt(*input.NextToken, 10, 64)
+		if err != nil {
+			return fmt.Errorf("Invalid NextToken value")
+		}
+	}
+
+	maxResults := int64(100)
+	if input.MaxResults != nil {
+		maxResults = *input.MaxResults
+		if maxResults <= 0 || maxResults > 100 {
+			return fmt.Errorf("MaxResults must be between 1 and 100, inclusive")
+		}
+	}
+
+	var results []*ec2.SecurityGroup
+	for _, sg := range m.securityGroups {
+		groupID := *sg.GroupId
+		for _, groupIDFilter := range input.GroupNames {
+			if aws.StringValue(groupIDFilter) == groupID {
+				results = append(results, sg)
+				break
+			}
+		}
+	}
+
+	nResults := int64(len(results))
+	for i := startAt; i < nResults; i += maxResults {
+		end := i + maxResults
+		lastPage := false
+
+		if end >= nResults {
+			end = nResults
+			lastPage = true
+		}
+
+		output.SetSecurityGroups(results[i:end])
+		if !iter(&output, lastPage) {
+			break
+		}
+	}
+
+	return nil
+}
+
 type SSMMock struct {
 	ssmiface.SSMAPI
 
-	parameters map[string]*ssm.Parameter
+	parameters    map[string]*ssm.Parameter
+	parameterTags map[string][]*ssm.Tag
 }
 
 func (m *SSMMock) GetParameters(input *ssm.GetParametersInput) (*ssm.GetParametersOutput, error) {
@@ -216,6 +366,9 @@ func (m *SSMMock) PutParameter(input *ssm.PutParameterInput) (*ssm.PutParameterO
 	if m.parameters == nil {
 		m.parameters = make(map[string]*ssm.Parameter)
 	}
+	if m.parameterTags == nil {
+		m.parameterTags = make(map[string][]*ssm.Tag)
+	}
 
 	var dataType string
 	if input.DataType != nil {
@@ -247,10 +400,45 @@ func (m *SSMMock) PutParameter(input *ssm.PutParameterInput) (*ssm.PutParameterO
 	arn := fmt.Sprintf("arn:aws:ssm:us-west-2:123456789012:parameter/%s", strings.TrimLeft(name, "/"))
 
 	param := ssm.Parameter{
-		ARN: &arn, Name: input.Name, Value: input.Value, DataType: &dataType, Version: &version, Type: input.Type,
+		ARN: &arn, Name: CopyAWSString(input.Name), Value: CopyAWSString(input.Value),
+		DataType: &dataType, Version: &version, Type: CopyAWSString(input.Type),
 	}
 	m.parameters[name] = &param
+
+	var tags []*ssm.Tag
+	for _, tag := range input.Tags {
+		tags = append(tags, &ssm.Tag{Key: CopyAWSString(tag.Key), Value: CopyAWSString(tag.Value)})
+	}
+	m.parameterTags[name] = tags
 	return &ssm.PutParameterOutput{Tier: &tier, Version: &version}, nil
+}
+
+func (m *SSMMock) ListTagsForResource(input *ssm.ListTagsForResourceInput) (*ssm.ListTagsForResourceOutput, error) {
+	if input.ResourceId == nil {
+		return nil, fmt.Errorf("ResourceId must be specified")
+	}
+	resourceID := *input.ResourceId
+
+	if input.ResourceType == nil {
+		return nil, fmt.Errorf("ResourceType must be specified")
+	}
+	resourceType := *input.ResourceType
+
+	if resourceType != "Parameter" {
+		return nil, fmt.Errorf("ResourceType %v is not supported", resourceType)
+	}
+
+	tags, present := m.parameterTags[resourceID]
+	if !present {
+		return nil, fmt.Errorf("Resource %v of type %s not found", resourceID, resourceType)
+	}
+
+	output := ssm.ListTagsForResourceOutput{}
+	for _, tag := range tags {
+		output.TagList = append(output.TagList, &ssm.Tag{Key: CopyAWSString(tag.Key), Value: CopyAWSString(tag.Value)})
+	}
+
+	return &output, nil
 }
 
 type STSMock struct {
