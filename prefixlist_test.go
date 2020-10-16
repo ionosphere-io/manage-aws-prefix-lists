@@ -679,3 +679,187 @@ func TestReplacePrefixList(c *testing.T) {
 		}
 	}
 }
+
+func TestReplaceSecurityGroupRules(c *testing.T) {
+	prefixesIPv4 := []IPv4Prefix{
+		{IPPrefix: "10.20.0.0/16", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPPrefix: "10.22.0.0/16", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPPrefix: "10.23.0.0/16", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2-lax-1"},
+	}
+	prefixesIPv6 := []IPv6Prefix{
+		{IPv6Prefix: "fc00:20::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:22::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2"},
+		{IPv6Prefix: "fc00:23::/64", Region: "us-west-2", Service: "CLOUDFRONT", NetworkBorderGroup: "us-west-2-lax-1"},
+	}
+
+	ipRanges := IPRanges{SyncToken: "1", CreateDate: "2000-01-01-00-00-00", Prefixes: prefixesIPv4, IPv6Prefixes: prefixesIPv6}
+	server, err := StartIPRangesServer(c, &ipRanges)
+	if err != nil {
+		c.Fatalf("Unable to start IP ranges server: %v", err)
+		return
+	}
+	defer server.Shutdown()
+
+	ec2Mock := &EC2Mock{}
+	ssmMock := &SSMMock{}
+	ctx := context.WithValue(context.Background(), EC2ClientKey, ec2Mock)
+	ctx = context.WithValue(ctx, SSMClientKey, ssmMock)
+	ctx = context.WithValue(ctx, STSClientKey, &STSMock{})
+	req := ManageAWSPrefixListsRequest{}
+	if err = json.Unmarshal([]byte(`{
+	"PrefixListNameBase": "cloudfront",
+	"PrefixListTags": [{"Key": "Service", "Value": "Cloudfront"}],
+	"Filters": [
+		{"Service": "CLOUDFRONT", "RegionRegex": "us-.*", "NetworkBorderGroupRegex": "^us-[^-]+-[0-9]+$"}
+	],
+	"GroupSize": 10
+}`), &req); err != nil {
+		c.Fatalf("Failed to create request: %v", err)
+	}
+	req.IPRangesURL = server.GetURL()
+	response, error := HandleLambdaRequest(ctx, req)
+
+	if error != nil {
+		c.Errorf("Failed to handle request: %v\n", error)
+		return
+	}
+	responseDecoded := make(map[string]interface{})
+	error = json.Unmarshal([]byte(response), &responseDecoded)
+	if error != nil {
+		c.Errorf("Failed to unmarshal response as JSON: %v\n", error)
+		return
+	}
+
+	if len(ec2Mock.managedPrefixLists) != 2 {
+		c.Errorf("Expected 2 prefix lists to be created, got %d", len(ec2Mock.managedPrefixLists))
+		return
+	}
+
+	var ipv4PrefixListID string
+	var ipv6PrefixListID string
+
+	for prefixListID, mpl := range ec2Mock.managedPrefixLists {
+		switch *mpl.PrefixList.AddressFamily {
+		case "IPv4":
+			ipv4PrefixListID = prefixListID
+			if ok, msg := comparePrefixes(mpl.Entries, []string{"10.20.0.0/16", "10.22.0.0/16"}); !ok {
+				c.Errorf("IPv4 prefix list incorrect: %s", msg)
+				return
+			}
+		case "IPv6":
+			ipv6PrefixListID = prefixListID
+			if ok, msg := comparePrefixes(mpl.Entries, []string{"fc00:20::/64", "fc00:22::/64"}); !ok {
+				c.Errorf("IPv6 prefix list incorrect: %s", msg)
+				return
+			}
+		}
+	}
+
+	// Create a security group and have it reference these prefix lists
+	if ec2Mock.securityGroups == nil {
+		ec2Mock.securityGroups = make(map[string]*ec2.SecurityGroup)
+	}
+	ec2Mock.securityGroups["sg-00000001"] = &ec2.SecurityGroup{
+		GroupId: aws.String("sg-00000001"), GroupName: aws.String("TestGroup"), Description: aws.String("TestGroup"),
+		OwnerId: aws.String("123456789012"), VpcId: aws.String("vpc-00000001"),
+		IpPermissions: []*ec2.IpPermission{
+			{
+				FromPort: aws.Int64(443), ToPort: aws.Int64(443), IpProtocol: aws.String("tcp"),
+				PrefixListIds: []*ec2.PrefixListId{
+					{PrefixListId: &ipv4PrefixListID},
+					{PrefixListId: &ipv6PrefixListID},
+				},
+			},
+			{
+				FromPort: aws.Int64(-1), ToPort: aws.Int64(-1), IpProtocol: aws.String("-1"),
+				IpRanges: []*ec2.IpRange{
+					{CidrIp: aws.String("10.199.0.0/16")},
+				},
+			},
+		},
+	}
+
+	// Change the prefix list group size
+	req.GroupSize = 20
+	response, error = HandleLambdaRequest(ctx, req)
+
+	if error != nil {
+		c.Errorf("Failed to handle request: %v\n", error)
+		return
+	}
+	responseDecoded = make(map[string]interface{})
+	error = json.Unmarshal([]byte(response), &responseDecoded)
+	if error != nil {
+		c.Errorf("Failed to unmarshal response as JSON: %v\n", error)
+		return
+	}
+
+	if len(ec2Mock.managedPrefixLists) != 2 {
+		c.Errorf("Expected 2 prefix lists to be created, got %d", len(ec2Mock.managedPrefixLists))
+		return
+	}
+
+	var newIPv4PrefixListID string
+	var newIPv6PrefixListID string
+
+	for prefixListID, mpl := range ec2Mock.managedPrefixLists {
+		switch *mpl.PrefixList.AddressFamily {
+		case "IPv4":
+			newIPv4PrefixListID = prefixListID
+			if ok, msg := comparePrefixes(mpl.Entries, []string{"10.20.0.0/16", "10.22.0.0/16"}); !ok {
+				c.Errorf("IPv4 prefix list incorrect: %s", msg)
+				return
+			}
+		case "IPv6":
+			newIPv6PrefixListID = prefixListID
+			if ok, msg := comparePrefixes(mpl.Entries, []string{"fc00:20::/64", "fc00:22::/64"}); !ok {
+				c.Errorf("IPv6 prefix list incorrect: %s", msg)
+				return
+			}
+		}
+	}
+
+	sg := ec2Mock.securityGroups["sg-00000001"]
+	foundStaticCidr := false
+	ipv4PrefixListSeen := false
+	ipv6PrefixListSeen := false
+
+	for _, perm := range sg.IpPermissions {
+		c.Logf("Considering permission %v", perm)
+		fromPort := aws.Int64Value(perm.FromPort)
+		if fromPort == 443 {
+			for _, prefixListID := range perm.PrefixListIds {
+				plID := aws.StringValue(prefixListID.PrefixListId)
+
+				if plID == newIPv4PrefixListID {
+					ipv4PrefixListSeen = true
+				} else if plID == newIPv6PrefixListID {
+					ipv6PrefixListSeen = true
+				} else if plID == ipv4PrefixListID {
+					c.Errorf("Old IPv4 prefix list found in security group: %v instead of new prefix list %v", ipv4PrefixListID, newIPv4PrefixListID)
+				} else if plID == ipv6PrefixListID {
+					c.Errorf("Old IPv6 prefix list found in security group: %v instead of new prefix list %v", ipv6PrefixListID, newIPv6PrefixListID)
+				} else {
+					c.Errorf("Unexpected prefix list in security group: %v", plID)
+				}
+			}
+		} else if fromPort == -1 {
+			for _, ipRange := range perm.IpRanges {
+				cidrIP := aws.StringValue(ipRange.CidrIp)
+				if cidrIP == "10.199.0.0/16" {
+					foundStaticCidr = true
+				}
+			}
+		}
+	}
+
+	if !ipv4PrefixListSeen {
+		c.Errorf("Failed to find new IPv4PrefixListId (%s) in security group: %v", newIPv4PrefixListID, sg)
+	}
+	if !ipv6PrefixListSeen {
+		c.Errorf("Failed to find new IPv6PrefixListId (%s) in security group: %v", newIPv6PrefixListID, sg)
+	}
+	if !foundStaticCidr {
+		c.Errorf("Failed to find security group rule containing static IPs")
+	}
+}

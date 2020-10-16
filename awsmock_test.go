@@ -421,7 +421,7 @@ func (m *EC2Mock) DescribeSecurityGroupsPages(input *ec2.DescribeSecurityGroupsI
 	var results []*ec2.SecurityGroup
 	for _, sg := range m.securityGroups {
 		groupID := *sg.GroupId
-		for _, groupIDFilter := range input.GroupNames {
+		for _, groupIDFilter := range input.GroupIds {
 			if aws.StringValue(groupIDFilter) == groupID {
 				results = append(results, sg)
 				break
@@ -446,6 +446,183 @@ func (m *EC2Mock) DescribeSecurityGroupsPages(input *ec2.DescribeSecurityGroupsI
 	}
 
 	return nil
+}
+
+func (m *EC2Mock) AuthorizeSecurityGroupIngress(input *ec2.AuthorizeSecurityGroupIngressInput) (*ec2.AuthorizeSecurityGroupIngressOutput, error) {
+	if input.GroupId == nil {
+		return nil, fmt.Errorf("Security GroupId must be specified")
+	}
+
+	groupID := *input.GroupId
+
+	if m.securityGroups == nil {
+		m.securityGroups = make(map[string]*ec2.SecurityGroup)
+	}
+
+	sg, found := m.securityGroups[groupID]
+	if !found {
+		return nil, fmt.Errorf("Security group with GroupId %v not found", groupID)
+	}
+
+	for _, perm := range input.IpPermissions {
+		var ipRangesCopy []*ec2.IpRange
+		var ipv6RangesCopy []*ec2.Ipv6Range
+		var prefixListIDsCopy []*ec2.PrefixListId
+		var userIDGroupPairsCopy []*ec2.UserIdGroupPair
+
+		for _, ipRange := range perm.IpRanges {
+			ipRangesCopy = append(ipRangesCopy, &ec2.IpRange{
+				CidrIp: CopyAWSString(ipRange.CidrIp), Description: CopyAWSString(ipRange.Description),
+			})
+		}
+
+		for _, ipv6Range := range perm.Ipv6Ranges {
+			ipv6RangesCopy = append(ipv6RangesCopy, &ec2.Ipv6Range{
+				CidrIpv6: CopyAWSString(ipv6Range.CidrIpv6), Description: CopyAWSString(ipv6Range.Description),
+			})
+		}
+
+		for _, prefixListID := range perm.PrefixListIds {
+			prefixListIDsCopy = append(prefixListIDsCopy, &ec2.PrefixListId{
+				PrefixListId: CopyAWSString(prefixListID.PrefixListId), Description: CopyAWSString(prefixListID.Description),
+			})
+		}
+
+		for _, userIDGroupPair := range perm.UserIdGroupPairs {
+			userIDGroupPairsCopy = append(userIDGroupPairsCopy, &ec2.UserIdGroupPair{
+				GroupId: CopyAWSString(userIDGroupPair.GroupId), GroupName: CopyAWSString(userIDGroupPair.GroupName),
+				UserId: CopyAWSString(userIDGroupPair.UserId), VpcId: CopyAWSString(userIDGroupPair.VpcId),
+				VpcPeeringConnectionId: CopyAWSString(userIDGroupPair.VpcPeeringConnectionId),
+				PeeringStatus:          CopyAWSString(userIDGroupPair.PeeringStatus),
+				Description:            CopyAWSString(userIDGroupPair.Description),
+			})
+		}
+
+		permCopy := ec2.IpPermission{
+			IpProtocol: CopyAWSString(perm.IpProtocol), FromPort: CopyAWSInt64(perm.FromPort), ToPort: CopyAWSInt64(perm.ToPort),
+			IpRanges: ipRangesCopy, Ipv6Ranges: ipv6RangesCopy, PrefixListIds: prefixListIDsCopy,
+			UserIdGroupPairs: userIDGroupPairsCopy,
+		}
+		sg.IpPermissions = append(sg.IpPermissions, &permCopy)
+	}
+
+	return &ec2.AuthorizeSecurityGroupIngressOutput{}, nil
+}
+
+func (m *EC2Mock) RevokeSecurityGroupIngress(input *ec2.RevokeSecurityGroupIngressInput) (*ec2.RevokeSecurityGroupIngressOutput, error) {
+	if input.GroupId == nil {
+		return nil, fmt.Errorf("Security GroupId must be specified")
+	}
+
+	groupID := *input.GroupId
+
+	if m.securityGroups == nil {
+		m.securityGroups = make(map[string]*ec2.SecurityGroup)
+	}
+
+	sg, found := m.securityGroups[groupID]
+	if !found {
+		return nil, fmt.Errorf("Security group with GroupId %v not found", groupID)
+	}
+
+	keptPerms := make([]*ec2.IpPermission, 0, len(input.IpPermissions))
+	for _, perm := range sg.IpPermissions {
+		keptIPRanges := make([]*ec2.IpRange, 0, len(perm.IpRanges))
+		keptIPv6Ranges := make([]*ec2.Ipv6Range, 0, len(perm.Ipv6Ranges))
+		keptPrefixListIDs := make([]*ec2.PrefixListId, 0, len(perm.PrefixListIds))
+
+		// Filter out IPv4 CIDR blocks that match
+	ipRangeLoop:
+		for _, existingIPRange := range perm.IpRanges {
+			existingCIDRIP := aws.StringValue(existingIPRange.CidrIp)
+
+			// Look for rules on the IpPermissions slice.
+			for _, inputPerm := range input.IpPermissions {
+				// Does the protocol/port range match?
+				if aws.Int64Value(perm.FromPort) != aws.Int64Value(inputPerm.FromPort) &&
+					aws.Int64Value(perm.ToPort) != aws.Int64Value(inputPerm.ToPort) &&
+					aws.StringValue(perm.IpProtocol) != aws.StringValue(inputPerm.IpProtocol) {
+					continue
+				}
+
+				for _, inputIPRange := range inputPerm.IpRanges {
+					if existingCIDRIP == aws.StringValue(inputIPRange.CidrIp) {
+						// Rule matched -- don't include this IP range
+						continue ipRangeLoop
+					}
+				}
+			}
+
+			// No rules matched; keep this CIDR block
+			keptIPRanges = append(keptIPRanges, existingIPRange)
+		}
+
+		// Filter out IPv6 CIDR blocks that match
+	ipv6RangeLoop:
+		for _, existingIPv6Range := range perm.Ipv6Ranges {
+			existingCIDRIPv6 := aws.StringValue(existingIPv6Range.CidrIpv6)
+
+			// Look for rules on the IpPermissions slice.
+			for _, inputPerm := range input.IpPermissions {
+				// Does the protocol/port range match?
+				if aws.Int64Value(perm.FromPort) != aws.Int64Value(inputPerm.FromPort) &&
+					aws.Int64Value(perm.ToPort) != aws.Int64Value(inputPerm.ToPort) &&
+					aws.StringValue(perm.IpProtocol) != aws.StringValue(inputPerm.IpProtocol) {
+					continue
+				}
+
+				for _, inputIPv6Range := range inputPerm.Ipv6Ranges {
+					if existingCIDRIPv6 == aws.StringValue(inputIPv6Range.CidrIpv6) {
+						// Rule matched -- don't include this IP range
+						continue ipv6RangeLoop
+					}
+				}
+			}
+
+			// No rules matched; keep this CIDR block
+			keptIPv6Ranges = append(keptIPv6Ranges, existingIPv6Range)
+		}
+
+		// And finally filter out prefix lists that match
+	prefixListLoop:
+		for _, existingPrefixListID := range perm.PrefixListIds {
+			existingPLID := aws.StringValue(existingPrefixListID.PrefixListId)
+
+			// Look for rules on the IpPermissions slice.
+			for _, inputPerm := range input.IpPermissions {
+				// Does the protocol/port range match?
+				if aws.Int64Value(perm.FromPort) != aws.Int64Value(inputPerm.FromPort) &&
+					aws.Int64Value(perm.ToPort) != aws.Int64Value(inputPerm.ToPort) &&
+					aws.StringValue(perm.IpProtocol) != aws.StringValue(inputPerm.IpProtocol) {
+					continue
+				}
+
+				for _, inputPrefixListID := range inputPerm.PrefixListIds {
+					if existingPLID == aws.StringValue(inputPrefixListID.PrefixListId) {
+						// Rule matched -- don't include this IP range
+						continue prefixListLoop
+					}
+				}
+			}
+
+			// No rules matched; keep this CIDR block
+			keptPrefixListIDs = append(keptPrefixListIDs, existingPrefixListID)
+		}
+
+		// Don't keep empty permissions
+		if len(keptIPRanges) > 0 || len(keptIPv6Ranges) > 0 || len(keptPrefixListIDs) > 0 {
+			// Replace the permission's ranges with the items we kept
+			perm.IpRanges = keptIPRanges
+			perm.Ipv6Ranges = keptIPv6Ranges
+			perm.PrefixListIds = keptPrefixListIDs
+
+			keptPerms = append(keptPerms, perm)
+		}
+	}
+
+	sg.IpPermissions = keptPerms
+
+	return &ec2.RevokeSecurityGroupIngressOutput{}, nil
 }
 
 type SSMMock struct {
