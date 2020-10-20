@@ -633,7 +633,7 @@ func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(secu
 	if len(revoke) > 0 {
 		// Again, we need to revoke before authorizing.
 		input := ec2.RevokeSecurityGroupEgressInput{
-			DryRun: aws.Bool(false), GroupId: aws.String(existingPrefixListID), IpPermissions: revoke,
+			DryRun: aws.Bool(false), GroupId: securityGroup.GroupId, IpPermissions: revoke,
 		}
 
 		if _, err := plafm.ec2.RevokeSecurityGroupEgress(&input); err != nil {
@@ -645,7 +645,7 @@ func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(secu
 			})
 		} else {
 			input := ec2.AuthorizeSecurityGroupEgressInput{
-				DryRun: aws.Bool(false), GroupId: aws.String(existingPrefixListID), IpPermissions: authorize,
+				DryRun: aws.Bool(false), GroupId: securityGroup.GroupId, IpPermissions: authorize,
 			}
 			if _, err := plafm.ec2.AuthorizeSecurityGroupEgress(&input); err != nil {
 				log.Printf("Failed to authorize security groups %s egress rule for prefix list %s (%s): %v", *securityGroup.GroupId,

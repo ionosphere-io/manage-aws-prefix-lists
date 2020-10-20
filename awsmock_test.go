@@ -448,23 +448,46 @@ func (m *EC2Mock) DescribeSecurityGroupsPages(input *ec2.DescribeSecurityGroupsI
 	return nil
 }
 
+type ruleType int
+
+const (
+	ingress ruleType = iota
+	egress
+)
+
 func (m *EC2Mock) AuthorizeSecurityGroupIngress(input *ec2.AuthorizeSecurityGroupIngressInput) (*ec2.AuthorizeSecurityGroupIngressOutput, error) {
-	if input.GroupId == nil {
-		return nil, fmt.Errorf("Security GroupId must be specified")
+	err := m.authorizeSecurityGroupRules(input.GroupId, input.IpPermissions, ingress)
+	if err != nil {
+		return nil, err
 	}
 
-	groupID := *input.GroupId
+	return &ec2.AuthorizeSecurityGroupIngressOutput{}, nil
+}
+
+func (m *EC2Mock) AuthorizeSecurityGroupEgress(input *ec2.AuthorizeSecurityGroupEgressInput) (*ec2.AuthorizeSecurityGroupEgressOutput, error) {
+	err := m.authorizeSecurityGroupRules(input.GroupId, input.IpPermissions, egress)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ec2.AuthorizeSecurityGroupEgressOutput{}, nil
+}
+
+func (m *EC2Mock) authorizeSecurityGroupRules(groupID *string, permissions []*ec2.IpPermission, ruleType ruleType) error {
+	if groupID == nil {
+		return fmt.Errorf("Security GroupId must be specified")
+	}
 
 	if m.securityGroups == nil {
 		m.securityGroups = make(map[string]*ec2.SecurityGroup)
 	}
 
-	sg, found := m.securityGroups[groupID]
+	sg, found := m.securityGroups[*groupID]
 	if !found {
-		return nil, fmt.Errorf("Security group with GroupId %v not found", groupID)
+		return fmt.Errorf("Security group with GroupId %v not found", *groupID)
 	}
 
-	for _, perm := range input.IpPermissions {
+	for _, perm := range permissions {
 		var ipRangesCopy []*ec2.IpRange
 		var ipv6RangesCopy []*ec2.Ipv6Range
 		var prefixListIDsCopy []*ec2.PrefixListId
@@ -503,30 +526,58 @@ func (m *EC2Mock) AuthorizeSecurityGroupIngress(input *ec2.AuthorizeSecurityGrou
 			IpRanges: ipRangesCopy, Ipv6Ranges: ipv6RangesCopy, PrefixListIds: prefixListIDsCopy,
 			UserIdGroupPairs: userIDGroupPairsCopy,
 		}
-		sg.IpPermissions = append(sg.IpPermissions, &permCopy)
+
+		if ruleType == ingress {
+			sg.IpPermissions = append(sg.IpPermissions, &permCopy)
+		} else {
+			sg.IpPermissionsEgress = append(sg.IpPermissionsEgress, &permCopy)
+		}
 	}
 
-	return &ec2.AuthorizeSecurityGroupIngressOutput{}, nil
+	return nil
 }
 
 func (m *EC2Mock) RevokeSecurityGroupIngress(input *ec2.RevokeSecurityGroupIngressInput) (*ec2.RevokeSecurityGroupIngressOutput, error) {
-	if input.GroupId == nil {
-		return nil, fmt.Errorf("Security GroupId must be specified")
+	err := m.revokeSecurityGroupRules(input.GroupId, input.IpPermissions, ingress)
+	if err != nil {
+		return nil, err
 	}
 
-	groupID := *input.GroupId
+	return &ec2.RevokeSecurityGroupIngressOutput{}, nil
+}
+
+func (m *EC2Mock) RevokeSecurityGroupEgress(input *ec2.RevokeSecurityGroupEgressInput) (*ec2.RevokeSecurityGroupEgressOutput, error) {
+	err := m.revokeSecurityGroupRules(input.GroupId, input.IpPermissions, egress)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ec2.RevokeSecurityGroupEgressOutput{}, nil
+}
+
+func (m *EC2Mock) revokeSecurityGroupRules(groupID *string, permissions []*ec2.IpPermission, ruleType ruleType) error {
+	if groupID == nil {
+		return fmt.Errorf("Security GroupId must be specified")
+	}
 
 	if m.securityGroups == nil {
 		m.securityGroups = make(map[string]*ec2.SecurityGroup)
 	}
 
-	sg, found := m.securityGroups[groupID]
+	sg, found := m.securityGroups[*groupID]
 	if !found {
-		return nil, fmt.Errorf("Security group with GroupId %v not found", groupID)
+		return fmt.Errorf("Security group with GroupId %v not found", *groupID)
 	}
 
-	keptPerms := make([]*ec2.IpPermission, 0, len(input.IpPermissions))
-	for _, perm := range sg.IpPermissions {
+	var sgPermissions []*ec2.IpPermission
+	if ruleType == ingress {
+		sgPermissions = sg.IpPermissions
+	} else {
+		sgPermissions = sg.IpPermissionsEgress
+	}
+
+	keptPerms := make([]*ec2.IpPermission, 0, len(sgPermissions))
+	for _, perm := range sgPermissions {
 		keptIPRanges := make([]*ec2.IpRange, 0, len(perm.IpRanges))
 		keptIPv6Ranges := make([]*ec2.Ipv6Range, 0, len(perm.Ipv6Ranges))
 		keptPrefixListIDs := make([]*ec2.PrefixListId, 0, len(perm.PrefixListIds))
@@ -537,7 +588,7 @@ func (m *EC2Mock) RevokeSecurityGroupIngress(input *ec2.RevokeSecurityGroupIngre
 			existingCIDRIP := aws.StringValue(existingIPRange.CidrIp)
 
 			// Look for rules on the IpPermissions slice.
-			for _, inputPerm := range input.IpPermissions {
+			for _, inputPerm := range permissions {
 				// Does the protocol/port range match?
 				if aws.Int64Value(perm.FromPort) != aws.Int64Value(inputPerm.FromPort) &&
 					aws.Int64Value(perm.ToPort) != aws.Int64Value(inputPerm.ToPort) &&
@@ -563,7 +614,7 @@ func (m *EC2Mock) RevokeSecurityGroupIngress(input *ec2.RevokeSecurityGroupIngre
 			existingCIDRIPv6 := aws.StringValue(existingIPv6Range.CidrIpv6)
 
 			// Look for rules on the IpPermissions slice.
-			for _, inputPerm := range input.IpPermissions {
+			for _, inputPerm := range permissions {
 				// Does the protocol/port range match?
 				if aws.Int64Value(perm.FromPort) != aws.Int64Value(inputPerm.FromPort) &&
 					aws.Int64Value(perm.ToPort) != aws.Int64Value(inputPerm.ToPort) &&
@@ -589,7 +640,7 @@ func (m *EC2Mock) RevokeSecurityGroupIngress(input *ec2.RevokeSecurityGroupIngre
 			existingPLID := aws.StringValue(existingPrefixListID.PrefixListId)
 
 			// Look for rules on the IpPermissions slice.
-			for _, inputPerm := range input.IpPermissions {
+			for _, inputPerm := range permissions {
 				// Does the protocol/port range match?
 				if aws.Int64Value(perm.FromPort) != aws.Int64Value(inputPerm.FromPort) &&
 					aws.Int64Value(perm.ToPort) != aws.Int64Value(inputPerm.ToPort) &&
@@ -620,9 +671,13 @@ func (m *EC2Mock) RevokeSecurityGroupIngress(input *ec2.RevokeSecurityGroupIngre
 		}
 	}
 
-	sg.IpPermissions = keptPerms
+	if ruleType == ingress {
+		sg.IpPermissions = keptPerms
+	} else {
+		sg.IpPermissionsEgress = keptPerms
+	}
 
-	return &ec2.RevokeSecurityGroupIngressOutput{}, nil
+	return nil
 }
 
 type SSMMock struct {

@@ -777,6 +777,15 @@ func TestReplaceSecurityGroupRules(c *testing.T) {
 				},
 			},
 		},
+		IpPermissionsEgress: []*ec2.IpPermission{
+			{
+				FromPort: aws.Int64(443), ToPort: aws.Int64(443), IpProtocol: aws.String("tcp"),
+				PrefixListIds: []*ec2.PrefixListId{
+					{PrefixListId: &ipv4PrefixListID},
+					{PrefixListId: &ipv6PrefixListID},
+				},
+			},
+		},
 	}
 
 	// Change the prefix list group size
