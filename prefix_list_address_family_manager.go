@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -24,6 +25,9 @@ type PrefixListAddressFamilyManager struct {
 
 	// accountID is the 12-digit account identifier for this account.
 	accountID string
+
+	// prefixListNameBase provides the root of the prefix list names
+	prefixListNameBase string
 
 	// ec2 is a handle to the EC2 service.
 	ec2 ec2iface.EC2API
@@ -57,14 +61,17 @@ type PrefixListAddressFamilyManager struct {
 
 	// prefixListIds is the final set of prefix lists encompassing this filter.
 	prefixListIDs []string
+
+	// metrics is a list of metrics to send to CloudWatch
+	metrics []*cloudwatch.MetricDatum
 }
 
 // NewPrefixListAddressFamilyManager creates a new PrefixListAddressFamilyManager object with the specified parameters.
-func NewPrefixListAddressFamilyManager(partition string, accountID string, ec2Client ec2iface.EC2API, ssmClient ssmiface.SSMAPI,
-	addressFamily string, groupSize uint, prefixListTags TagMap) *PrefixListAddressFamilyManager {
+func NewPrefixListAddressFamilyManager(partition string, accountID string, prefixListNameBase string, ec2Client ec2iface.EC2API,
+	ssmClient ssmiface.SSMAPI, addressFamily string, groupSize uint, prefixListTags TagMap) *PrefixListAddressFamilyManager {
 	return &PrefixListAddressFamilyManager{
-		partition: partition, accountID: accountID, ec2: ec2Client, ssm: ssmClient, addressFamily: addressFamily,
-		groupSize: groupSize, tags: prefixListTags,
+		partition: partition, accountID: accountID, prefixListNameBase: prefixListNameBase, ec2: ec2Client, ssm: ssmClient,
+		addressFamily: addressFamily, groupSize: groupSize, tags: prefixListTags,
 	}
 }
 
@@ -86,7 +93,15 @@ func (plafm *PrefixListAddressFamilyManager) filterAndAggregatePrefixes(filters 
 		}
 	}
 
+	// Save information for CloudWatch about the number of prefixes we kept.
+	AddMetric(plafm, MetricPrefixes, float64(len(filteredPrefixes)), UnitCount)
+
+	// Stop here if there are no prefixes.
 	if len(filteredPrefixes) == 0 {
+		// Save 0 for the AggregatedPrefixes and Groups metric.
+		AddMetric(plafm, MetricAggregatedPrefixes, 0.0, UnitCount)
+		AddMetric(plafm, MetricGroups, 0.0, UnitCount)
+
 		log.Printf("No prefixes returned for filters: %v", filters)
 		return nil
 	}
@@ -108,6 +123,10 @@ func (plafm *PrefixListAddressFamilyManager) filterAndAggregatePrefixes(filters 
 	for _, prefix := range aggregatedPrefixes {
 		plafm.keptPrefixes = append(plafm.keptPrefixes, prefix.String())
 	}
+
+	// Save aggregation metrics.
+	AddMetric(plafm, MetricAggregatedPrefixes, float64(len(plafm.keptPrefixes)), UnitCount)
+	AddMetric(plafm, MetricGroups, float64(plafm.nGroups), UnitCount)
 
 	return nil
 }
@@ -138,9 +157,9 @@ func filterMatches(filter *IPRangesFilter, prefix IPPrefix) bool {
 }
 
 // generatePrefixListNames generates a list of prefix list names over the given number of groups.
-func (plafm *PrefixListAddressFamilyManager) generatePrefixListNames(prefixListNameBase string, tpl *template.Template) error {
+func (plafm *PrefixListAddressFamilyManager) generatePrefixListNames(tpl *template.Template) error {
 	templateVars := PrefixListTemplateVars{
-		PrefixListNameBase: prefixListNameBase, AddressFamily: plafm.addressFamily, GroupCount: strconv.FormatUint(uint64(plafm.nGroups), 10),
+		PrefixListNameBase: plafm.prefixListNameBase, AddressFamily: plafm.addressFamily, GroupCount: strconv.FormatUint(uint64(plafm.nGroups), 10),
 	}
 
 	plafm.prefixListNames = make([]string, 0, plafm.nGroups)
@@ -164,9 +183,9 @@ func (plafm *PrefixListAddressFamilyManager) mapPrefixListNamesToExistingPrefixL
 	for groupID, prefixListName := range plafm.prefixListNames {
 		var filters []*ec2.Filter
 
-		filters = append(filters, MakeEC2Filter("prefix-list-name", prefixListName))
-		filters = append(filters, MakeEC2Filter("owner-id", plafm.accountID))
-		filters = append(filters, MakeEC2Filter("tag:GroupId", strconv.FormatInt(int64(groupID), 10)))
+		filters = append(filters, MakeEC2Filter(FilterPrefixListName, prefixListName))
+		filters = append(filters, MakeEC2Filter(FilterOwnerID, plafm.accountID))
+		filters = append(filters, MakeEC2Filter(FilterTagGroupID, strconv.FormatInt(int64(groupID), 10)))
 
 		for tagKey, tagValue := range plafm.tags {
 			filters = append(filters, MakeEC2Filter(fmt.Sprintf("tag:%s", tagKey), tagValue))
@@ -209,6 +228,8 @@ func (plafm *PrefixListAddressFamilyManager) mapPrefixListNamesToExistingPrefixL
 	return nil
 }
 
+// updateManagedPrefixLists updates (either by replacing entries or replacing the prefix list itself -- see managePrefixListGroup)
+// each group in a prefix list.
 func (plafm *PrefixListAddressFamilyManager) updateManagedPrefixLists() []PrefixListManagementOp {
 	nGroups := len(plafm.prefixListNames)
 	var results []PrefixListManagementOp
@@ -223,18 +244,22 @@ func (plafm *PrefixListAddressFamilyManager) updateManagedPrefixLists() []Prefix
 		existingPrefixList := plafm.prefixListNamesToExistingPrefixLists[prefixListName]
 		prefixBlock := plafm.keptPrefixes[i:end]
 
-		results = append(results, plafm.managePrefixListBlock(groupID, prefixListName, existingPrefixList, prefixBlock)...)
+		results = append(results, plafm.managePrefixListGroup(groupID, prefixListName, existingPrefixList, prefixBlock)...)
 	}
 
 	return results
 }
 
-// managePrefixListBlock creates or upates a prefix list corresponding to a block of prefixes. This block may be a subset of the
+// managePrefixListGroup creates or upates a prefix list corresponding to a block of prefixes. This block may be a subset of the
 // full set of prefixes returned by the filters -- it's always less than or equal to the group size.
-func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) []PrefixListManagementOp {
+func (plafm *PrefixListAddressFamilyManager) managePrefixListGroup(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) []PrefixListManagementOp {
+	defer Time(plafm, MetricExaminePrefixListGroup, DimGroupID(groupID)).Done()
+
 	if existingPrefixList == nil {
 		// No existing prefix list. Create one.
-		prefixList, err := plafm.createPrefixList(groupID, prefixListName, prefixBlock)
+		createPrefixListGroupTimer := Time(plafm, MetricCreatePrefixListGroup, DimGroupID(groupID))
+		prefixList, err := plafm.createPrefixListGroup(groupID, prefixListName, prefixBlock)
+		createPrefixListGroupTimer.Done()
 		result := PrefixListManagementOp{
 			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily,
 		}
@@ -243,6 +268,7 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 			result.Operation = OpPrefixListCreateFailedError
 			result.Error = err
 		} else {
+			AddMetric(plafm, MetricCreatePrefixListGroupSuccess, float64(createPrefixListGroupTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
 			result.Operation = OpCreatePrefixList
 			result.NewPrefixListID = aws.StringValue(prefixList.PrefixListId)
 			plafm.prefixListIDs = append(plafm.prefixListIDs, result.NewPrefixListID)
@@ -277,6 +303,7 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 			DryRun: aws.Bool(false), PrefixListId: &existingPrefixListID,
 		}
 
+		getManagedPrefixListEntriesTimer := Time(plafm, MetricGetManagedPrefixListEntries, DimGroupID(groupID))
 		err := plafm.ec2.GetManagedPrefixListEntriesPages(&input, func(output *ec2.GetManagedPrefixListEntriesOutput, _ bool) bool {
 			for _, ple := range output.Entries {
 				prefix := aws.StringValue(ple.Cidr)
@@ -293,6 +320,7 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 			}
 			return true
 		})
+		getManagedPrefixListEntriesTimer.Done()
 
 		// Failed to get the existing entries.
 		if err != nil {
@@ -308,11 +336,13 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 
 			return []PrefixListManagementOp{result}
 		}
+		AddMetric(plafm, MetricGetManagedPrefixListEntriesSuccess, float64(getManagedPrefixListEntriesTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
 	}
 
 	if replacementNeeded {
+		defer Time(plafm, MetricReplacePrefixListGroup, DimGroupID(groupID)).Done()
 		// replacePrefixList will set the new id in plafm.prefixListIDs.
-		return plafm.replacePrefixList(groupID, prefixListName, existingPrefixList, prefixBlock)
+		return plafm.replacePrefixListGroup(groupID, prefixListName, existingPrefixList, prefixBlock)
 	}
 
 	// We know that this prefix list will be retained at this point. Add it to the prefix lists that are considered final.
@@ -335,6 +365,8 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 		}}
 	}
 
+	updatePrefixListGroupTimer := Time(plafm, MetricUpdatePrefixListGroup, DimGroupID(groupID))
+
 	// The total should be under the group size.
 	modify := ec2.ModifyManagedPrefixListInput{
 		PrefixListId: existingPrefixList.PrefixListId, CurrentVersion: existingPrefixList.Version, DryRun: aws.Bool(false),
@@ -342,8 +374,10 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 	}
 
 	log.Printf("Modifying prefix list %s (%s): AddEntries=%v, RemoveEntries=%v", existingPrefixListID, prefixListName, addEntriesStr, removeEntriesStr)
+	_, err := plafm.ec2.ModifyManagedPrefixList(&modify)
+	updatePrefixListGroupTimer.Done()
 
-	if _, err := plafm.ec2.ModifyManagedPrefixList(&modify); err != nil {
+	if err != nil {
 		log.Printf("Failed to modify prefix list %s (%s): %v", existingPrefixListID, prefixListName, err)
 		return []PrefixListManagementOp{{
 			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListUpdateFailedError,
@@ -351,14 +385,16 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListBlock(groupID uint,
 		}}
 	}
 
+	AddMetric(plafm, MetricUpdatePrefixListGroupSuccess, float64(updatePrefixListGroupTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
+
 	return []PrefixListManagementOp{{
 		PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpUpdatePrefixListEntries,
 		ExistingPrefixListID: existingPrefixListID,
 	}}
 }
 
-// createPrefixList creates a prefix list with the given name and block of IP addresses.
-func (plafm *PrefixListAddressFamilyManager) createPrefixList(groupID uint, prefixListName string, prefixBlock []string) (*ec2.ManagedPrefixList, error) {
+// createPrefixListGroup creates a prefix list with the given name and block of IP addresses.
+func (plafm *PrefixListAddressFamilyManager) createPrefixListGroup(groupID uint, prefixListName string, prefixBlock []string) (*ec2.ManagedPrefixList, error) {
 	var entries []*ec2.AddPrefixListEntry
 
 	for _, prefix := range prefixBlock {
@@ -383,7 +419,7 @@ func (plafm *PrefixListAddressFamilyManager) createPrefixList(groupID uint, pref
 	return output.PrefixList, nil
 }
 
-func (plafm *PrefixListAddressFamilyManager) replacePrefixList(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) []PrefixListManagementOp {
+func (plafm *PrefixListAddressFamilyManager) replacePrefixListGroup(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) []PrefixListManagementOp {
 	existingPrefixListID := *existingPrefixList.PrefixListId
 	results := make([]PrefixListManagementOp, 0, 1)
 
@@ -393,6 +429,7 @@ func (plafm *PrefixListAddressFamilyManager) replacePrefixList(groupID uint, pre
 	}
 	securityGroupIDs := make([]*string, 0)
 
+	getPrefixListAssociationsTimer := Time(plafm, MetricGetPrefixListAssociations, DimGroupID(groupID))
 	err := plafm.ec2.GetManagedPrefixListAssociationsPages(&input, func(output *ec2.GetManagedPrefixListAssociationsOutput, _ bool) bool {
 		for _, pla := range output.PrefixListAssociations {
 			if pla.ResourceOwner == nil {
@@ -417,6 +454,7 @@ func (plafm *PrefixListAddressFamilyManager) replacePrefixList(groupID uint, pre
 
 		return true
 	})
+	getPrefixListAssociationsTimer.Done()
 
 	// We couldn't figure out who is referencing this list. Note the error and continue.
 	if err != nil {
@@ -426,8 +464,13 @@ func (plafm *PrefixListAddressFamilyManager) replacePrefixList(groupID uint, pre
 		})
 	}
 
+	AddMetric(plafm, MetricGetPrefixListAssociationsSuccess, float64(getPrefixListAssociationsTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
+
+	createPrefixListGroupTimer := Time(plafm, MetricCreatePrefixListGroup, DimGroupID(groupID))
 	// Create a new prefix list first.
-	newPrefixList, err := plafm.createPrefixList(groupID, prefixListName, prefixBlock)
+	newPrefixList, err := plafm.createPrefixListGroup(groupID, prefixListName, prefixBlock)
+	createPrefixListGroupTimer.Done()
+
 	if err != nil {
 		// This isn't a good situation. For now, mark the existing as final for this block so we don't drop rules.
 		plafm.prefixListIDs = append(plafm.prefixListIDs, existingPrefixListID)
@@ -439,6 +482,8 @@ func (plafm *PrefixListAddressFamilyManager) replacePrefixList(groupID uint, pre
 		// Don't attempt to replace this.
 		return results
 	}
+
+	AddMetric(plafm, MetricCreatePrefixListGroupSuccess, float64(createPrefixListGroupTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
 
 	// We were successful in creating the new prefix list. Add it to the list of final prefix lists.
 	newPrefixListID := aws.StringValue(newPrefixList.PrefixListId)
@@ -515,6 +560,7 @@ outer:
 	}
 
 	// Move each security group to point to the new prefix list.
+	describeSecurityGroupsTimer := Time(plafm, MetricDescribeSecurityGroups, DimGroupID(groupID))
 	err = plafm.ec2.DescribeSecurityGroupsPages(
 		&ec2.DescribeSecurityGroupsInput{DryRun: aws.Bool(false), GroupIds: securityGroupIDs},
 		func(output *ec2.DescribeSecurityGroupsOutput, _ bool) bool {
@@ -524,6 +570,8 @@ outer:
 			}
 			return true
 		})
+	describeSecurityGroupsTimer.Done()
+
 	if err != nil {
 		log.Printf("Failed to describe security groups related to prefix list %s (%s): %v", existingPrefixListID,
 			prefixListName, err)
@@ -720,12 +768,14 @@ func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(paramete
 				})
 			} else {
 				results = append(results, PrefixListManagementOp{
-					AddressFamily: plafm.addressFamily, Operation: OpSSMParameterValueUpdated,
-					SSMParameterName: *parameter.Name,
+					AddressFamily: plafm.addressFamily, Operation: OpSSMParameterValueUpdated, SSMParameterName: *parameter.Name,
 				})
 			}
 		} else {
 			log.Printf("SSM parameter %s value is up-to-date", *parameter.Name)
+			results = append(results, PrefixListManagementOp{
+				AddressFamily: plafm.addressFamily, Operation: OpNoModifySSMParameterValue, SSMParameterName: *parameter.Name,
+			})
 		}
 
 		// And check the tags for this resource
@@ -821,4 +871,16 @@ func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(paramete
 	}
 
 	return results
+}
+
+// AddMetric saves a metric datum to the saved metrics on this object.
+func (plafm *PrefixListAddressFamilyManager) AddMetric(datum *cloudwatch.MetricDatum) {
+	plafm.metrics = append(plafm.metrics, datum)
+}
+
+// CreateMetric is a utility function for creating a CloudWatch metric datum pre-populated with our dimensions. It also
+// sets the timestamp to the current time.
+func (plafm *PrefixListAddressFamilyManager) CreateMetric() *cloudwatch.MetricDatum {
+	dimensions := []*cloudwatch.Dimension{DimAddressFamily(plafm.addressFamily), DimPrefixListNameBase(plafm.prefixListNameBase)}
+	return new(cloudwatch.MetricDatum).SetTimestamp(time.Now().UTC()).SetDimensions(dimensions)
 }

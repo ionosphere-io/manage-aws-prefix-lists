@@ -47,7 +47,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		result, err := HandleLambdaRequest(nil, request)
+		result, err := HandleLambdaRequest(context.Background(), request)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Request failed: %v\n", err)
 			os.Exit(1)

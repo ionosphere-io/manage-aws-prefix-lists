@@ -48,7 +48,6 @@ func (ipr *ipRangesHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request)
 	rw.Header().Add("Content-Length", fmt.Sprintf("%d", len(serialized)))
 	rw.WriteHeader(http.StatusBadRequest)
 	rw.Write(serialized)
-	return
 }
 
 // IPRangesServer represents a running test ip-ranges.json server.

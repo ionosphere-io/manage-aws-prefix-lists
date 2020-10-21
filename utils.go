@@ -6,11 +6,13 @@ import (
 	"net"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 	"unicode"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/cloudwatch"
 	"github.com/aws/aws-sdk-go/service/ec2"
 )
 
@@ -193,4 +195,19 @@ func CopyAWSInt64(value *int64) *int64 {
 		return nil
 	}
 	return aws.Int64(aws.Int64Value(value))
+}
+
+// DimAddressFamily creates a CloudWatch metrics dimension for the address family.
+func DimAddressFamily(addressFamily string) *cloudwatch.Dimension {
+	return &cloudwatch.Dimension{Name: aws.String(DimNameAddressFamily), Value: aws.String(addressFamily)}
+}
+
+// DimGroupID creates a CloudWatch metrics dimension for the group ID.
+func DimGroupID(groupID uint) *cloudwatch.Dimension {
+	return &cloudwatch.Dimension{Name: aws.String(DimNameGroupID), Value: aws.String(strconv.FormatUint(uint64(groupID), 10))}
+}
+
+// DimPrefixListNameBase create a CloudWatch metrics dimension for the prefix list name base.
+func DimPrefixListNameBase(prefixListNameBase string) *cloudwatch.Dimension {
+	return &cloudwatch.Dimension{Name: aws.String(DimNamePrefixListNameBase), Value: aws.String(prefixListNameBase)}
 }

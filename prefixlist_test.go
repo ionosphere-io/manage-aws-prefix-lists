@@ -700,9 +700,11 @@ func TestReplaceSecurityGroupRules(c *testing.T) {
 	}
 	defer server.Shutdown()
 
+	cwMock := &CloudWatchMock{}
 	ec2Mock := &EC2Mock{}
 	ssmMock := &SSMMock{}
-	ctx := context.WithValue(context.Background(), EC2ClientKey, ec2Mock)
+	ctx := context.WithValue(context.Background(), CloudWatchClientKey, cwMock)
+	ctx = context.WithValue(ctx, EC2ClientKey, ec2Mock)
 	ctx = context.WithValue(ctx, SSMClientKey, ssmMock)
 	ctx = context.WithValue(ctx, STSClientKey, &STSMock{})
 	req := ManageAWSPrefixListsRequest{}
@@ -712,6 +714,10 @@ func TestReplaceSecurityGroupRules(c *testing.T) {
 	"Filters": [
 		{"Service": "CLOUDFRONT", "RegionRegex": "us-.*", "NetworkBorderGroupRegex": "^us-[^-]+-[0-9]+$"}
 	],
+	"Metrics": {
+		"Namespace": "Test",
+		"Verbosity": 1
+	},
 	"GroupSize": 10
 }`), &req); err != nil {
 		c.Fatalf("Failed to create request: %v", err)
@@ -870,5 +876,15 @@ func TestReplaceSecurityGroupRules(c *testing.T) {
 	}
 	if !foundStaticCidr {
 		c.Errorf("Failed to find security group rule containing static IPs")
+	}
+
+	// Check CloudWatch metrics
+	if cwMock.metrics == nil {
+		c.Errorf("No CloudWatch metrics written")
+	} else {
+		metrics := cwMock.metrics["Test"]
+		if metrics == nil {
+			c.Errorf("No CloudWatch metrics written to Test namespace")
+		}
 	}
 }

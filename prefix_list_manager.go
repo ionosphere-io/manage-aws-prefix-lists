@@ -7,10 +7,13 @@ import (
 	"io/ioutil"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/arn"
 	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/cloudwatch"
+	"github.com/aws/aws-sdk-go/service/cloudwatch/cloudwatchiface"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/sns"
@@ -23,14 +26,14 @@ import (
 
 // PrefixListManager is the main structure for holding the state of the prefix list manager application.
 type PrefixListManager struct {
-	// ctx is the context passed to us.
-	ctx context.Context
-
 	// partition is the AWS partition we're operating in.
 	partition string
 
 	// accountID is the 12-digit account identifier for this account.
 	accountID string
+
+	// cw is a handle to the AWS CloudWatch metrics service.
+	cw cloudwatchiface.CloudWatchAPI
 
 	// ec2 is a handle to the AWS EC2 (Elasitc Compute Cloud) service.
 	ec2 ec2iface.EC2API
@@ -59,15 +62,24 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 
 	plm := new(PrefixListManager)
 
-	awsSession := session.New()
+	awsSession, err := session.NewSession()
+	if err != nil {
+		log.Printf("Failed to create an AWS session: %v", err)
+		return nil, err
+	}
 	var present bool
 
+	var cwClient cloudwatchiface.CloudWatchAPI
 	var ec2Client ec2iface.EC2API
 	var ssmClient ssmiface.SSMAPI
 	var stsClient stsiface.STSAPI
 	var snsClient snsiface.SNSAPI
 
-	// Retrieve interfaces from the context if they're present (for testing).
+	// Retrieve interfaces from the context if they're present (for testing); otherwise, create a client to the real service.
+	if cwClient, present = ctx.Value(CloudWatchClientKey).(cloudwatchiface.CloudWatchAPI); !present {
+		cwClient = cloudwatch.New(awsSession)
+	}
+
 	if ec2Client, present = ctx.Value(EC2ClientKey).(ec2iface.EC2API); !present {
 		ec2Client = ec2.New(awsSession)
 	}
@@ -84,6 +96,7 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 		snsClient = sns.New(awsSession)
 	}
 
+	plm.cw = cwClient
 	plm.ec2 = ec2Client
 	plm.ssm = ssmClient
 	plm.sns = snsClient
@@ -104,8 +117,8 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 	plm.partition = callerIDARN.Partition
 	plm.request = request
 
-	plm.ipv4 = NewPrefixListAddressFamilyManager(plm.partition, plm.accountID, plm.ec2, plm.ssm, "IPv4", plm.request.GroupSize, plm.request.PrefixListTags)
-	plm.ipv6 = NewPrefixListAddressFamilyManager(plm.partition, plm.accountID, plm.ec2, plm.ssm, "IPv6", plm.request.GroupSize, plm.request.PrefixListTags)
+	plm.ipv4 = NewPrefixListAddressFamilyManager(plm.partition, plm.accountID, plm.request.PrefixListNameBase, plm.ec2, plm.ssm, "IPv4", plm.request.GroupSize, plm.request.PrefixListTags)
+	plm.ipv6 = NewPrefixListAddressFamilyManager(plm.partition, plm.accountID, plm.request.PrefixListNameBase, plm.ec2, plm.ssm, "IPv6", plm.request.GroupSize, plm.request.PrefixListTags)
 
 	return plm, nil
 }
@@ -167,11 +180,11 @@ func (plm *PrefixListManager) Process() ([]PrefixListManagementOp, error) {
 	}
 
 	// Get the prefix list names -- this may fail, so we want to capture any errors before we make modifications to AWS.
-	if err := plm.ipv4.generatePrefixListNames(plm.request.PrefixListNameBase, plm.request.PrefixListNameTemplate); err != nil {
+	if err := plm.ipv4.generatePrefixListNames(plm.request.PrefixListNameTemplate); err != nil {
 		return nil, err
 	}
 
-	if err := plm.ipv6.generatePrefixListNames(plm.request.PrefixListNameBase, plm.request.PrefixListNameTemplate); err != nil {
+	if err := plm.ipv6.generatePrefixListNames(plm.request.PrefixListNameTemplate); err != nil {
 		return nil, err
 	}
 
@@ -195,13 +208,73 @@ func (plm *PrefixListManager) Process() ([]PrefixListManagementOp, error) {
 	ops = append(ops, plm.ipv6.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv6Parameters, plm.request.SSMParameters.Tags,
 		plm.request.SSMParameters.Tier)...)
 
+	// Determine how many operations succeeded
+	nSucceeded := uint(0)
+	for _, op := range ops {
+		if !op.Operation.IsError() {
+			nSucceeded++
+		}
+	}
+
+	plm.writeCloudWatchMetrics(ops, nSucceeded)
+
 	// Create notifications for SNS
-	plm.NotifySNS(ops)
+	plm.notifySNS(ops)
 
 	return ops, nil
 }
 
+func (plm *PrefixListManager) writeCloudWatchMetrics(ops []PrefixListManagementOp, nSucceeded uint) {
+	// Skip this if we're not writing metrics (MetricsNamespace is empty)
+	if plm.request.Metrics.Namespace == nil {
+		return
+	}
+
+	metrics := make([]*cloudwatch.MetricDatum, 0, len(plm.ipv4.metrics)+len(plm.ipv6.metrics)+2)
+
+	now := time.Now().UTC()
+
+	// Add detailed metrics only if requested.
+	if plm.request.Metrics.Verbosity > 0 {
+		metrics = append(metrics, plm.ipv4.metrics...)
+		metrics = append(metrics, plm.ipv6.metrics...)
+	}
+
+	// Add metrics indicating the total number of operations and the number of operations that failed.
+	metrics = append(metrics,
+		&cloudwatch.MetricDatum{
+			MetricName: aws.String(MetricOperationsAttempted),
+			Dimensions: []*cloudwatch.Dimension{DimPrefixListNameBase(plm.request.PrefixListNameBase)},
+			Timestamp:  &now,
+			Value:      aws.Float64(float64(len(ops))),
+			Unit:       aws.String(UnitCount),
+		},
+		&cloudwatch.MetricDatum{
+			MetricName: aws.String(MetricOperationsSucceeded),
+			Dimensions: []*cloudwatch.Dimension{DimPrefixListNameBase(plm.request.PrefixListNameBase)},
+			Timestamp:  &now,
+			Value:      aws.Float64(float64(nSucceeded)),
+			Unit:       aws.String(UnitCount),
+		})
+
+	// Send metrics in batches (20 is the limit for the number of metrics accepted in a single PutMetrics call).
+	nMetrics := uint(len(metrics))
+	for i := uint(0); i < nMetrics; i += MetricsBatchSize {
+		end := i + 20
+		if end > nMetrics {
+			end = nMetrics
+		}
+
+		batch := metrics[i:end]
+		_, err := plm.cw.PutMetricData(&cloudwatch.PutMetricDataInput{
+			Namespace: plm.request.Metrics.Namespace, MetricData: batch})
+		if err != nil {
+			log.Printf("Failed to write metrics batch to CloudWatch: %v", err)
+		}
+	}
+}
+
 // NotifySNS publishes a notification to SNS from the operations performed.
-func (plm *PrefixListManager) NotifySNS(ops []PrefixListManagementOp) {
+func (plm *PrefixListManager) notifySNS(ops []PrefixListManagementOp) {
 
 }

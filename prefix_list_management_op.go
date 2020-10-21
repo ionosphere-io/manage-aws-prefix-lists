@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/aws/aws-sdk-go/aws/awserr"
 )
@@ -164,3 +165,7 @@ const (
 	// to update.
 	OpSSMParameterTagsUpdateFailedError
 )
+
+func (opType OperationType) IsError() bool {
+	return strings.HasSuffix(opType.String(), "Error")
+}

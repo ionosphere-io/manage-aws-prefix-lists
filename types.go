@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws/arn"
+	"github.com/aws/aws-sdk-go/service/cloudwatch"
 )
 
 // DefaultPrefixListNameTemplate is the default template used when a template is not specified.
@@ -27,8 +28,129 @@ const DefaultGroupSize uint = 60
 // MaxRetries is the maximum number of times to retry an API call
 const MaxRetries uint = 5
 
+// MetricsBatchSize is the number of metrics to write to CloudWatch in a single PutMetrics call.
+const MetricsBatchSize uint = 20
+
 // SleepDuration is the amount of time to sleep before refreshing state
 const SleepDuration time.Duration = 200 * time.Millisecond
+
+const (
+	// DimNameAddressFamily is the CloudWatch metrics dimension name for the AddressFamily dimension.
+	DimNameAddressFamily string = "AddressFamily"
+
+	// DimNameGroupID is the CloudWatch metrics dimension name for the GroupId dimension.
+	DimNameGroupID string = "GroupID"
+
+	// DimNamePrefixListNameBase is the CloudWatch metrics dimension name for the PrefixListNameBase dimension.
+	DimNamePrefixListNameBase string = "PrefixListNameBase"
+
+	// MetricAggregatedPrefixes is the CloudWatch metrics name for the AggregatedPrefixes metric.
+	// This is the number of IP prefixes after aggregation has been performed and has an associated unit of Count.
+	MetricAggregatedPrefixes string = "AggregatedPrefixes"
+
+	// MetricCreatePrefixListGroup is the CloudWatch metrics name for the CreatePrefixListGroup metric.
+	// This measures the total amount of time required to create a prefix list and has an associated unit of Milliseconds.
+	// Measuring the SampleCount statistic will return the number of prefix list creation attempts.
+	MetricCreatePrefixListGroup string = "CreatePrefixListGroup"
+
+	// MetricCreatePrefixListGroupSuccess is the CloudWatch metrics name for the CreatePrefixListGroup:Success metric.
+	// This measures the total amount of time required on calls that successfully created a prefix list and has an associated unit
+	// of Milliseconds. Measuring the SampleCount statistic will return the number of prefix lists created.
+	MetricCreatePrefixListGroupSuccess string = "CreatePrefixListGroup:Success"
+
+	// MetricDescribeSecurityGroups is the CloudWatch Metrics name for the DescribeSecurityGroups metric.
+	// This measures the total amount of time required to describe the security groups associated with a prefix list and has
+	// an associated unit of Milliseconds. Measuring the SampleCount statistic will return the number of times security groups
+	// were described.
+	MetricDescribeSecurityGroups string = "DescribeSecurityGroups"
+
+	// MetricExaminePrefixListGroup is the CloudWatch Metrics name for the ExaminePrefixListGroup metric.
+	// This measures the total amount of time required to examine a prefix list and perform any update or replacement operations
+	// that are needed, and has an associated unit of Milliseconds. Measuring the SampleCount statistic will return the number of
+	// attempts made to examine a prefix list.
+	MetricExaminePrefixListGroup string = "ExaminePrefixList"
+
+	// MetricGetManagedPrefixListEntries is the CloudWatch Metrics name for the GetManagedPrefixListEntries metric.
+	// This measures the amount of time taken to retrieve the prefix list entries for a given prefix list (which can be multiple
+	// AWS API calls under the hood) and has an associated unit of Milliseconds. Measuring the SampleCount statistic will return
+	// the number of attempts made to get the prefix list entries.
+	MetricGetManagedPrefixListEntries string = "GetManagedPrefixListEntries"
+
+	// MetricGetManagedPrefixListEntriesSuccess is the CloudWatch Metrics name for the
+	// GetManagedPrefixListEntries:Success metric.
+	//
+	// This measures the amount of time taken for a successful call to retrieve the prefix list entries for a given prefix list
+	// (which can be multiple AWS API calls under the hood) and has an associated unit of Milliseconds. Measuring the SampleCount
+	// statistic will return the number of successful calls at getting the prefix list entries.
+	MetricGetManagedPrefixListEntriesSuccess string = "GetManagedPrefixListEntries:Success"
+
+	// MetricGetPrefixListAssociations is the CloudWatch Metrics name for the GetPrefixListAssociations metric.
+	//
+	// This measures the amount of time taken to retrieve the security groups associated with a prefix list and has an associated
+	// unit of Milliseconds. Measuring the SampleCount statistic will return the number of times this operation was performed.
+	MetricGetPrefixListAssociations string = "GetPrefixListAssociations"
+
+	// MetricGetPrefixListAssociationsSuccess is the CloudWatch Metrics name for the GetPrefixListAssociations:Success metric.
+	//
+	// This measures the amount of time taken for a successfull call to retrieve the security groups associated with a prefix list
+	// and has an associated unit of Milliseconds. Measuring the SampleCount statistic will return the number of times this
+	// operation was performed.
+	MetricGetPrefixListAssociationsSuccess string = "GetPrefixListAssociations:Success"
+
+	// MetricGroups is the CloudWatch metrics name for the Groups metric.
+	//
+	// This measures the number of groups a prefix list is divided into and has an associated unit of Count.
+	MetricGroups string = "Groups"
+
+	// MetricOperationsAttempted is the CloudWatch Metrics name for the OperationsAttempted metric.
+	//
+	// This measures the number of operations that were attempted in a single run of the prefix list manager.
+	MetricOperationsAttempted string = "OperationsAttempted"
+
+	// MetricOperationsSucceeded is the CloudWatch Metrics name for the OperationsSucceeded metric.
+	//
+	// This measures the number of operations that were attempted in a single run of the prefix list manager.
+	MetricOperationsSucceeded string = "OperationsSucceeded"
+
+	// MetricPrefixes is the CloudWatch metrics name for the Prefixes metric.
+	//
+	// This measures the number of IP prefixes returned by an operation, either the total number in ip-ranges.json (with no
+	// associated dimensions or after filtering (with AddressFamily and PrefixListNameBase dimensions) and has an associated unit
+	// of Count.
+	MetricPrefixes string = "Prefixes"
+
+	// MetricReplacePrefixListGroup is the CloudWatch metrics name for the ReplacePrefixListGroup metric.
+	// This indicates that a prefix list group had to be replaced and measures the amount of time taken to perform this operation.
+	// Measuring the SampleCount statistic will return the number of times a prefix list group had to be replaced.
+	MetricReplacePrefixListGroup string = "ReplacePrefixListGroup"
+
+	// MetricUpdatePrefixListGroup is the CloudWatch metrics name for the UpdatePrefixListGroup metric.
+	// This indicates that a prefix list group had entries that needed to be updated and measures the amount of time taken to
+	// perform this operation. Measuring the SampleCount statistic will return the number of times a prefix list group had to be
+	// updated.
+	MetricUpdatePrefixListGroup string = "UpdatePrefixListGroup"
+
+	// MetricUpdatePrefixListGroupSuccess is the CloudWatch metrics name for the UpdatePrefixListGroup:Success metric.
+	// This indicates that a prefix list group successfully had entries updated and measures the amount of time taken to perform
+	// this operation. Measuring the SampleCount statistic will return the number of times a prefix list group was successfully
+	// updated.
+	MetricUpdatePrefixListGroupSuccess string = "UpdatePrefixListGroup:Success"
+
+	// FilterOwnerID is the EC2 filter name for filtering based on owner account numbers.
+	FilterOwnerID string = "owner-id"
+
+	// FilterPrefixListName is the EC2 filter name for filtering based on prefix list names.
+	FilterPrefixListName string = "prefix-list-name"
+
+	// FilterTagGroupID is the EC2 filter name for filtering based on GroupId tag values.
+	FilterTagGroupID string = "tag:GroupId"
+
+	// UnitCount is the CloudWatch metrics unit name for counted metrics.
+	UnitCount string = "Count"
+
+	// UnitMilliseconds is the CloudWatch metrics unit name for millisecond-based metrics.
+	UnitMilliseconds string = "Milliseconds"
+)
 
 // ManageAWSPrefixListsRequest is the structure an incoming event is expected to adhere to.
 type ManageAWSPrefixListsRequest struct {
@@ -65,8 +187,8 @@ type ManageAWSPrefixListsRequest struct {
 	// Filters is a list of filters to apply to ip-ranges.json to filter the results. At least one filter must be specified.
 	Filters []IPRangesFilter
 
-	// MetricsNamespace is the CloudWatch metrics namespace to write metrics to. If unspecified or null, metrics are not published.
-	MetricsNamespace string
+	// Metrics contains information about the metrics to write.
+	Metrics PrefixListMetrics
 
 	// SSMParameters contains information about AWS Systems Manager parameters to write to. If unspecified or null, SSM parameters
 	// are not written.
@@ -88,16 +210,16 @@ type ManageAWSPrefixListsRequest struct {
 }
 
 type manageAWSPrefixListsRequestRaw struct {
-	PrefixListNameBase     string           `json:"PrefixListNameBase"`
-	PrefixListNameTemplate *string          `json:"PrefixListNameTemplate"`
-	PrefixListTags         TagMap           `json:"PrefixListTags"`
-	Filters                []IPRangesFilter `json:"Filters"`
-	MetricsNamespace       *string          `json:"MetricsNamespace"`
-	SSMParameters          *SSMParameters   `json:"SSMParameters"`
-	SNSSubject             *string          `json:"SNSSubject"`
-	SNSTopicARNs           []string         `json:"SNSTopicARNs"`
-	IPRangesURL            *string          `json:"IPRangesURL"`
-	GroupSize              *uint            `json:"GroupSize"`
+	PrefixListNameBase     string             `json:"PrefixListNameBase"`
+	PrefixListNameTemplate *string            `json:"PrefixListNameTemplate"`
+	PrefixListTags         TagMap             `json:"PrefixListTags"`
+	Filters                []IPRangesFilter   `json:"Filters"`
+	Metrics                *PrefixListMetrics `json:"Metrics"`
+	SSMParameters          *SSMParameters     `json:"SSMParameters"`
+	SNSSubject             *string            `json:"SNSSubject"`
+	SNSTopicARNs           []string           `json:"SNSTopicARNs"`
+	IPRangesURL            *string            `json:"IPRangesURL"`
+	GroupSize              *uint              `json:"GroupSize"`
 }
 
 // UnmarshalJSON converts JSON data to a ManageAWSPrefixListsRequest
@@ -126,16 +248,9 @@ func (req *ManageAWSPrefixListsRequest) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("At least one filter must be specified in Filters")
 	}
 
-	var metricsNamespace string
-	if raw.MetricsNamespace != nil {
-		if len(*raw.MetricsNamespace) == 0 {
-			return fmt.Errorf("MetricsNamespace cannot be empty")
-		}
-		if strings.HasPrefix(*raw.MetricsNamespace, ":") {
-			return fmt.Errorf("MetricsNamespace cannot start with ':'")
-		}
-
-		metricsNamespace = *raw.MetricsNamespace
+	metrics := PrefixListMetrics{}
+	if raw.Metrics != nil {
+		metrics = *raw.Metrics
 	}
 
 	var ssmParameters SSMParameters
@@ -185,7 +300,7 @@ func (req *ManageAWSPrefixListsRequest) UnmarshalJSON(data []byte) error {
 	req.PrefixListNameTemplate = tpl
 	req.PrefixListTags = raw.PrefixListTags
 	req.Filters = raw.Filters
-	req.MetricsNamespace = metricsNamespace
+	req.Metrics = metrics
 	req.SSMParameters = ssmParameters
 	req.SNSSubject = snsSubject
 	req.SNSTopicARNs = raw.SNSTopicARNs
@@ -296,6 +411,35 @@ func (ipate *AddressFamily) UnmarshalJSON(data []byte) error {
 	default:
 		return fmt.Errorf("Invalid value for AddressFamily; expected \"ALL\", \"IPv4\", or \"IPv6\": %v", string(data))
 	}
+
+	return nil
+}
+
+// PrefixListMetrics contains information about where and what type of metrics to write.
+type PrefixListMetrics struct {
+	Namespace *string `json:"Namespace"`
+	Verbosity int     `json:"Verbosity"`
+}
+
+type rawPrefixListMetrics PrefixListMetrics
+
+func (plm *PrefixListMetrics) UnmarshalJSON(data []byte) error {
+	var raw rawPrefixListMetrics
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+
+	if raw.Namespace != nil {
+		if len(*raw.Namespace) == 0 {
+			return fmt.Errorf("Metrics.Namespace cannot be empty")
+		}
+		if strings.HasPrefix(*raw.Namespace, ":") {
+			return fmt.Errorf("Metrics.Namespace cannot start with ':'")
+		}
+	}
+
+	plm.Namespace = raw.Namespace
+	plm.Verbosity = raw.Verbosity
 
 	return nil
 }
@@ -443,4 +587,44 @@ type PrefixListTemplateVars struct {
 	AddressFamily      string
 	GroupID            string
 	GroupCount         string
+}
+
+// MetricRecorder is an interface implemented by types that can hold or report metric datums to CloudWatch.
+// This is implemented by PrefixListAddressManager and PrefixListAddressFamilyManager.
+type MetricRecorder interface {
+	AddMetric(*cloudwatch.MetricDatum)
+	CreateMetric() *cloudwatch.MetricDatum
+}
+
+// AddMetric records a metric on any type that implmenets MetricRecorder.
+// This creates a CloudWatch metric datum with the specified name, value, and unit and saves it to the metric recorder.
+func AddMetric(mr MetricRecorder, name string, value float64, unit string, dimensions ...*cloudwatch.Dimension) {
+	datum := mr.CreateMetric().SetMetricName(name).SetValue(value).SetUnit(unit)
+	datum.Dimensions = append(datum.Dimensions, dimensions...)
+	mr.AddMetric(datum)
+}
+
+// MetricTimer represents a time metric (either in-progress or completed).
+type MetricTimer struct {
+	MetricRecorder MetricRecorder
+	Datum          *cloudwatch.MetricDatum
+	StartTime      time.Time
+	Elapsed        time.Duration
+}
+
+// Time starts a time metric with the specified metric name. It returns a callback to complete the timer.
+func Time(mr MetricRecorder, name string, dimensions ...*cloudwatch.Dimension) *MetricTimer {
+	datum := mr.CreateMetric().SetMetricName(name).SetUnit(UnitMilliseconds)
+	datum.Dimensions = append(datum.Dimensions, dimensions...)
+
+	return &MetricTimer{
+		MetricRecorder: mr, Datum: datum, StartTime: time.Now().UTC(),
+	}
+}
+
+// Done completes a time metric
+func (mt *MetricTimer) Done() {
+	mt.Elapsed = time.Now().UTC().Sub(mt.StartTime)
+	mt.Datum.SetValue(float64(mt.Elapsed.Milliseconds()))
+	mt.MetricRecorder.AddMetric(mt.Datum)
 }

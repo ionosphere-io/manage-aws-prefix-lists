@@ -2,6 +2,9 @@ package main
 
 // This file provides keys for retrieving values out of a Go context.
 
+// CloudWatchClientKey is a context key to use for retrieving a cloudwatchiface.CloudWatchAPI value from a context.
+var CloudWatchClientKey CloudWatchClientKeyType
+
 // EC2ClientKey is a context key to use for retrieving an ec2iface.EC2API value from a context.
 var EC2ClientKey EC2ClientKeyType
 
@@ -13,6 +16,9 @@ var STSClientKey STSClientKeyType
 
 // SNSClientKey is a context key to use for retrieving an snsiface.SNSAPI value from a context.
 var SNSClientKey SNSClientKeyType
+
+// CloudWatchClientKeyType is a context key structure identifying an cloudwatchiface.CloudWatchAPI to use when making API calls (for testing).
+type CloudWatchClientKeyType struct{}
 
 // EC2ClientKeyType is a context key structure identifying an ec2iface.EC2API to use when making API calls (for testing).
 type EC2ClientKeyType struct{}

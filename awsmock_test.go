@@ -7,6 +7,8 @@ import (
 	"strings"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/service/cloudwatch"
+	"github.com/aws/aws-sdk-go/service/cloudwatch/cloudwatchiface"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
 	"github.com/aws/aws-sdk-go/service/ssm"
@@ -14,6 +16,36 @@ import (
 	"github.com/aws/aws-sdk-go/service/sts"
 	"github.com/aws/aws-sdk-go/service/sts/stsiface"
 )
+
+type CloudWatchMock struct {
+	cloudwatchiface.CloudWatchAPI
+
+	metrics map[string][]*cloudwatch.MetricDatum
+}
+
+func (m *CloudWatchMock) PutMetricData(input *cloudwatch.PutMetricDataInput) (*cloudwatch.PutMetricDataOutput, error) {
+	if input.Namespace == nil {
+		return nil, fmt.Errorf("Namespace must be specified")
+	}
+
+	namespace := *input.Namespace
+
+	if len(namespace) == 0 {
+		return nil, fmt.Errorf("Namespace cannot be empty")
+	}
+
+	if namespace[0] == ':' {
+		return nil, fmt.Errorf("Namespace cannot start with ':'")
+	}
+
+	if m.metrics == nil {
+		m.metrics = make(map[string][]*cloudwatch.MetricDatum)
+	}
+
+	m.metrics[namespace] = append(m.metrics[namespace], input.MetricData...)
+
+	return &cloudwatch.PutMetricDataOutput{}, nil
+}
 
 type EC2Mock struct {
 	ec2iface.EC2API
