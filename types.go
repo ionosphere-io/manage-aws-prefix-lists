@@ -102,15 +102,17 @@ const (
 	// This measures the number of groups a prefix list is divided into and has an associated unit of Count.
 	MetricGroups string = "Groups"
 
-	// MetricOperationsAttempted is the CloudWatch Metrics name for the OperationsAttempted metric.
+	// MetricProcessRuns is the CloudWatch Metrics name for the ProcessRuns metric.
 	//
-	// This measures the number of operations that were attempted in a single run of the prefix list manager.
-	MetricOperationsAttempted string = "OperationsAttempted"
+	// This has a value of 1 Count if a run was performed; otherwise a metric is not written. Measuring the sum statistic over a
+	// period of time will yield the total number of process runs during that time interval.
+	MetricProcessRuns string = "ProcessRuns"
 
-	// MetricOperationsSucceeded is the CloudWatch Metrics name for the OperationsSucceeded metric.
+	// MetricProcessRunsSuccess is the CloudWatch Metrics name for the ProcessRuns:Success metric.
 	//
-	// This measures the number of operations that were attempted in a single run of the prefix list manager.
-	MetricOperationsSucceeded string = "OperationsSucceeded"
+	// This has a value of 1 Count if a run was performed with no errors, 0 Count otherwise. Measuring the sum statistic over a
+	// period of time will yield the total number of successful process runs during that time interval.
+	MetricProcessRunsSuccess string = "ProcessRuns:Success"
 
 	// MetricPrefixes is the CloudWatch metrics name for the Prefixes metric.
 	//
@@ -577,8 +579,8 @@ func (te *TierEnum) UnmarshalJSON(data []byte) error {
 
 // ManageAWSPrefixListsResponse is the response message returned by the handler
 type ManageAWSPrefixListsResponse struct {
-	Status     string
-	Operations []PrefixListManagementOp
+	Status string
+	Errors []string
 }
 
 // PrefixListTemplateVars is a structure holding the variables needed to render the prefix list name from a template.
@@ -587,6 +589,28 @@ type PrefixListTemplateVars struct {
 	AddressFamily      string
 	GroupID            string
 	GroupCount         string
+}
+
+// PrefixListNotification is the notification we send to SNS when needed.
+type PrefixListNotification struct {
+	PrefixListNameBase string                               `json:"PrefixListNameBase"`
+	IPv4               *PrefixListAddressFamilyNotification `json:"IPv4,omitempty"`
+	IPv6               *PrefixListAddressFamilyNotification `json:"IPv6,omitempty"`
+}
+
+// PrefixListAddressFamilyNotification is an SNS notification sub-structure containing the details about a given address family.
+type PrefixListAddressFamilyNotification struct {
+	PrefixCount          uint                    `json:"PrefixCount"`
+	PrefixListIDs        []string                `json:"PrefixListIds"`
+	UpdatedPrefixListIDs []string                `json:"UpdatedPrefixListIds"`
+	ReplacedPrefixLists  []PrefixListReplacement `json:"PrefixListReplacements,omitempty"`
+}
+
+// PrefixListReplacement is an SNS notification sub-struction describing the old prefix list and new prefix list it was replaced
+// by.
+type PrefixListReplacement struct {
+	OldPrefixListID string `json:"OldPrefixListId"`
+	NewPrefixListID string `json:"NewPrefixListId"`
 }
 
 // MetricRecorder is an interface implemented by types that can hold or report metric datums to CloudWatch.

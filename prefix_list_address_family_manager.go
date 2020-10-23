@@ -64,6 +64,15 @@ type PrefixListAddressFamilyManager struct {
 
 	// metrics is a list of metrics to send to CloudWatch
 	metrics []*cloudwatch.MetricDatum
+
+	// errors is a list of errors encountered when making changes
+	errors []error
+
+	// updatesPerformed indicates whether updates were made to the prefix lists for this address family.
+	updatesPerformed bool
+
+	// notification is the structure to send if notifications are sent.
+	notification PrefixListAddressFamilyNotification
 }
 
 // NewPrefixListAddressFamilyManager creates a new PrefixListAddressFamilyManager object with the specified parameters.
@@ -71,7 +80,7 @@ func NewPrefixListAddressFamilyManager(partition string, accountID string, prefi
 	ssmClient ssmiface.SSMAPI, addressFamily string, groupSize uint, prefixListTags TagMap) *PrefixListAddressFamilyManager {
 	return &PrefixListAddressFamilyManager{
 		partition: partition, accountID: accountID, prefixListNameBase: prefixListNameBase, ec2: ec2Client, ssm: ssmClient,
-		addressFamily: addressFamily, groupSize: groupSize, tags: prefixListTags,
+		addressFamily: addressFamily, groupSize: groupSize, tags: prefixListTags, updatesPerformed: false,
 	}
 }
 
@@ -123,6 +132,9 @@ func (plafm *PrefixListAddressFamilyManager) filterAndAggregatePrefixes(filters 
 	for _, prefix := range aggregatedPrefixes {
 		plafm.keptPrefixes = append(plafm.keptPrefixes, prefix.String())
 	}
+
+	// Save the number of prefixes in case we need to notify SNS.
+	plafm.notification.PrefixCount = uint(len(plafm.keptPrefixes))
 
 	// Save aggregation metrics.
 	AddMetric(plafm, MetricAggregatedPrefixes, float64(len(plafm.keptPrefixes)), UnitCount)
@@ -230,9 +242,8 @@ func (plafm *PrefixListAddressFamilyManager) mapPrefixListNamesToExistingPrefixL
 
 // updateManagedPrefixLists updates (either by replacing entries or replacing the prefix list itself -- see managePrefixListGroup)
 // each group in a prefix list.
-func (plafm *PrefixListAddressFamilyManager) updateManagedPrefixLists() []PrefixListManagementOp {
+func (plafm *PrefixListAddressFamilyManager) updateManagedPrefixLists() {
 	nGroups := len(plafm.prefixListNames)
-	var results []PrefixListManagementOp
 
 	for i, groupID := uint(0), uint(0); groupID < uint(nGroups); i, groupID = i+plafm.groupSize, groupID+1 {
 		end := i + plafm.groupSize
@@ -244,37 +255,33 @@ func (plafm *PrefixListAddressFamilyManager) updateManagedPrefixLists() []Prefix
 		existingPrefixList := plafm.prefixListNamesToExistingPrefixLists[prefixListName]
 		prefixBlock := plafm.keptPrefixes[i:end]
 
-		results = append(results, plafm.managePrefixListGroup(groupID, prefixListName, existingPrefixList, prefixBlock)...)
+		plafm.managePrefixListGroup(groupID, prefixListName, existingPrefixList, prefixBlock)
 	}
-
-	return results
 }
 
 // managePrefixListGroup creates or upates a prefix list corresponding to a block of prefixes. This block may be a subset of the
 // full set of prefixes returned by the filters -- it's always less than or equal to the group size.
-func (plafm *PrefixListAddressFamilyManager) managePrefixListGroup(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) []PrefixListManagementOp {
+func (plafm *PrefixListAddressFamilyManager) managePrefixListGroup(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) {
 	defer Time(plafm, MetricExaminePrefixListGroup, DimGroupID(groupID)).Done()
 
 	if existingPrefixList == nil {
 		// No existing prefix list. Create one.
+		plafm.updatesPerformed = true
+
 		createPrefixListGroupTimer := Time(plafm, MetricCreatePrefixListGroup, DimGroupID(groupID))
 		prefixList, err := plafm.createPrefixListGroup(groupID, prefixListName, prefixBlock)
 		createPrefixListGroupTimer.Done()
-		result := PrefixListManagementOp{
-			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily,
-		}
 
 		if err != nil {
-			result.Operation = OpPrefixListCreateFailedError
-			result.Error = err
-		} else {
-			AddMetric(plafm, MetricCreatePrefixListGroupSuccess, float64(createPrefixListGroupTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
-			result.Operation = OpCreatePrefixList
-			result.NewPrefixListID = aws.StringValue(prefixList.PrefixListId)
-			plafm.prefixListIDs = append(plafm.prefixListIDs, result.NewPrefixListID)
+			plafm.errors = append(plafm.errors, err)
+			return
 		}
 
-		return []PrefixListManagementOp{result}
+		AddMetric(plafm, MetricCreatePrefixListGroupSuccess, float64(createPrefixListGroupTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
+		plafm.prefixListIDs = append(plafm.prefixListIDs, *prefixList.PrefixListId)
+		plafm.notification.PrefixListIDs = append(plafm.notification.PrefixListIDs, *prefixList.PrefixListId)
+
+		return
 	}
 
 	// See if the existing prefix list can be reused
@@ -325,28 +332,30 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListGroup(groupID uint,
 		// Failed to get the existing entries.
 		if err != nil {
 			log.Printf("Failed to get entries for prefix list %s (%s): %v", existingPrefixListID, prefixListName, err)
-			result := PrefixListManagementOp{
-				PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListQueryFailedError,
-				ExistingPrefixListID: existingPrefixListID, Error: err,
-			}
+			plafm.errors = append(plafm.errors, err)
 
 			// Since we're not able to create or update a prefix list for this block, assume that this is ok for now. Otherwise,
 			// the prefix list may fall out of SSM and other brokenness may happen.
 			plafm.prefixListIDs = append(plafm.prefixListIDs, existingPrefixListID)
-
-			return []PrefixListManagementOp{result}
+			plafm.notification.PrefixListIDs = append(plafm.notification.PrefixListIDs, existingPrefixListID)
+			return
 		}
+
 		AddMetric(plafm, MetricGetManagedPrefixListEntriesSuccess, float64(getManagedPrefixListEntriesTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
 	}
 
 	if replacementNeeded {
+		plafm.updatesPerformed = true
 		defer Time(plafm, MetricReplacePrefixListGroup, DimGroupID(groupID)).Done()
 		// replacePrefixList will set the new id in plafm.prefixListIDs.
-		return plafm.replacePrefixListGroup(groupID, prefixListName, existingPrefixList, prefixBlock)
+		plafm.replacePrefixListGroup(groupID, prefixListName, existingPrefixList, prefixBlock)
+
+		return
 	}
 
 	// We know that this prefix list will be retained at this point. Add it to the prefix lists that are considered final.
 	plafm.prefixListIDs = append(plafm.prefixListIDs, existingPrefixListID)
+	plafm.notification.PrefixListIDs = append(plafm.notification.PrefixListIDs, existingPrefixListID)
 
 	// Generate the entries to add to the CIDR block.
 	for prefix, seen := range seenPrefixes {
@@ -357,14 +366,14 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListGroup(groupID uint,
 	}
 
 	if len(addEntries) == 0 && len(removeEntries) == 0 {
+		// Nothing to do
 		log.Printf("Prefix list %s (%s) is up-to-date; no modifications needed", existingPrefixListID, prefixListName)
-		// Nothing to do -- report back a no-op
-		return []PrefixListManagementOp{{
-			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpNoModifyPrefixList,
-			ExistingPrefixListID: existingPrefixListID,
-		}}
+		return
 	}
 
+	// Need to update the prefix list. Mark this as updated.
+	plafm.updatesPerformed = true
+	plafm.notification.UpdatedPrefixListIDs = append(plafm.notification.UpdatedPrefixListIDs, existingPrefixListID)
 	updatePrefixListGroupTimer := Time(plafm, MetricUpdatePrefixListGroup, DimGroupID(groupID))
 
 	// The total should be under the group size.
@@ -379,18 +388,10 @@ func (plafm *PrefixListAddressFamilyManager) managePrefixListGroup(groupID uint,
 
 	if err != nil {
 		log.Printf("Failed to modify prefix list %s (%s): %v", existingPrefixListID, prefixListName, err)
-		return []PrefixListManagementOp{{
-			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListUpdateFailedError,
-			ExistingPrefixListID: existingPrefixListID, Error: err,
-		}}
+		plafm.errors = append(plafm.errors, err)
 	}
 
 	AddMetric(plafm, MetricUpdatePrefixListGroupSuccess, float64(updatePrefixListGroupTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
-
-	return []PrefixListManagementOp{{
-		PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpUpdatePrefixListEntries,
-		ExistingPrefixListID: existingPrefixListID,
-	}}
 }
 
 // createPrefixListGroup creates a prefix list with the given name and block of IP addresses.
@@ -419,9 +420,8 @@ func (plafm *PrefixListAddressFamilyManager) createPrefixListGroup(groupID uint,
 	return output.PrefixList, nil
 }
 
-func (plafm *PrefixListAddressFamilyManager) replacePrefixListGroup(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) []PrefixListManagementOp {
+func (plafm *PrefixListAddressFamilyManager) replacePrefixListGroup(groupID uint, prefixListName string, existingPrefixList *ec2.ManagedPrefixList, prefixBlock []string) {
 	existingPrefixListID := *existingPrefixList.PrefixListId
-	results := make([]PrefixListManagementOp, 0, 1)
 
 	// Need to perform a wholesale replacement of this prefix list. Let's see what security groups depend on it first.
 	input := ec2.GetManagedPrefixListAssociationsInput{
@@ -459,9 +459,7 @@ func (plafm *PrefixListAddressFamilyManager) replacePrefixListGroup(groupID uint
 	// We couldn't figure out who is referencing this list. Note the error and continue.
 	if err != nil {
 		log.Printf("Can't replace prefix list %s: GetManagedPrefixListAssociations failed: %v", existingPrefixListID, err)
-		results = append(results, PrefixListManagementOp{
-			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListQueryFailedError, ExistingPrefixListID: existingPrefixListID, Error: err,
-		})
+		plafm.errors = append(plafm.errors, err)
 	}
 
 	AddMetric(plafm, MetricGetPrefixListAssociationsSuccess, float64(getPrefixListAssociationsTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
@@ -472,15 +470,11 @@ func (plafm *PrefixListAddressFamilyManager) replacePrefixListGroup(groupID uint
 	createPrefixListGroupTimer.Done()
 
 	if err != nil {
-		// This isn't a good situation. For now, mark the existing as final for this block so we don't drop rules.
+		// This isn't a good situation. Mark the existing as final for this block so we don't drop rules.
 		plafm.prefixListIDs = append(plafm.prefixListIDs, existingPrefixListID)
-
-		results = append(results, PrefixListManagementOp{
-			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListCreateFailedError, Error: err,
-		})
-
-		// Don't attempt to replace this.
-		return results
+		plafm.notification.PrefixListIDs = append(plafm.notification.PrefixListIDs, existingPrefixListID)
+		plafm.errors = append(plafm.errors, err)
+		return
 	}
 
 	AddMetric(plafm, MetricCreatePrefixListGroupSuccess, float64(createPrefixListGroupTimer.Elapsed.Milliseconds()), UnitMilliseconds, DimGroupID(groupID))
@@ -488,6 +482,10 @@ func (plafm *PrefixListAddressFamilyManager) replacePrefixListGroup(groupID uint
 	// We were successful in creating the new prefix list. Add it to the list of final prefix lists.
 	newPrefixListID := aws.StringValue(newPrefixList.PrefixListId)
 	plafm.prefixListIDs = append(plafm.prefixListIDs, newPrefixListID)
+	plafm.notification.PrefixListIDs = append(plafm.notification.PrefixListIDs, newPrefixListID)
+	plafm.notification.ReplacedPrefixLists = append(plafm.notification.ReplacedPrefixLists, PrefixListReplacement{
+		OldPrefixListID: existingPrefixListID, NewPrefixListID: newPrefixListID,
+	})
 
 	// Wait until the prefix list is ready before attempting to inject it into security groups.
 outer:
@@ -498,12 +496,8 @@ outer:
 			break outer
 		case "create-failed":
 			// Something happened during creation; bail out here.
-			results = append(results, PrefixListManagementOp{
-				PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListCreateFailedError,
-				NewPrefixListID: newPrefixListID,
-				Error:           fmt.Errorf("Prefix list creation failed asynchronously for prefix list %s", newPrefixListID),
-			})
-			return results
+			plafm.errors = append(plafm.errors, fmt.Errorf("Creation of prefix list %s failed asynchronously", newPrefixListID))
+			return
 		case "create-in-progress":
 			// Refresh the state.
 			time.Sleep(SleepDuration)
@@ -515,22 +509,16 @@ outer:
 			var err error
 			if output, err = plafm.ec2.DescribeManagedPrefixLists(&input); err != nil {
 				log.Printf("Failed to describe prefix list %s (%s): %v", existingPrefixListID, prefixListName, err)
-				results = append(results, PrefixListManagementOp{
-					PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListQueryFailedError,
-					NewPrefixListID: newPrefixListID, Error: err,
-				})
-				return results
+				plafm.errors = append(plafm.errors, err)
+				return
 			}
 
 			// Make sure we have exactly one result
 			if len(output.PrefixLists) == 0 {
 				log.Printf("While querying status of prefix list %s (%s): prefix list disappeared from results", existingPrefixListID, prefixListName)
 				err := fmt.Errorf("Prefix list state query failed for prefix list %s: prefix list not found", newPrefixListID)
-				results = append(results, PrefixListManagementOp{
-					PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListQueryFailedError,
-					NewPrefixListID: newPrefixListID, Error: err,
-				})
-				return results
+				plafm.errors = append(plafm.errors, err)
+				return
 			}
 
 			if len(output.PrefixLists) > 1 {
@@ -538,11 +526,8 @@ outer:
 					prefixListName, len(output.PrefixLists))
 				err := fmt.Errorf("Prefix list state query failed for prefix list %s: multiple prefix lists returned: %v",
 					newPrefixListID, output.PrefixLists)
-				results = append(results, PrefixListManagementOp{
-					PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListQueryFailedError,
-					NewPrefixListID: newPrefixListID, Error: err,
-				})
-				return results
+				plafm.errors = append(plafm.errors, err)
+				return
 			}
 
 			newPrefixList = output.PrefixLists[0]
@@ -551,11 +536,8 @@ outer:
 			log.Printf("While querying status of prefix list %s (%s): entered unrecognized state %s", existingPrefixListID,
 				prefixListName, state)
 			err := fmt.Errorf("Prefix list creation for prefix list %s entered unrecognized state %s", newPrefixListID, state)
-			results = append(results, PrefixListManagementOp{
-				PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListCreateFailedError,
-				NewPrefixListID: newPrefixListID, Error: err,
-			})
-			return results
+			plafm.errors = append(plafm.errors, err)
+			return
 		}
 	}
 
@@ -565,44 +547,31 @@ outer:
 		&ec2.DescribeSecurityGroupsInput{DryRun: aws.Bool(false), GroupIds: securityGroupIDs},
 		func(output *ec2.DescribeSecurityGroupsOutput, _ bool) bool {
 			for _, securityGroup := range output.SecurityGroups {
-				results = append(results, plafm.replaceSecurityGroupReferences(
-					securityGroup, prefixListName, existingPrefixListID, newPrefixListID)...)
+				plafm.replaceSecurityGroupReferences(securityGroup, prefixListName, existingPrefixListID, newPrefixListID)
 			}
 			return true
 		})
 	describeSecurityGroupsTimer.Done()
 
 	if err != nil {
+		// We weren't able to describe the security groups; note the error, but carry on with deletion (which will still fail
+		// if there actually are prefix lists attached.
 		log.Printf("Failed to describe security groups related to prefix list %s (%s): %v", existingPrefixListID,
 			prefixListName, err)
-		results = append(results, PrefixListManagementOp{
-			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpSecurityGroupQueryFailedError,
-			ExistingPrefixListID: existingPrefixListID, Error: err,
-		})
+		plafm.errors = append(plafm.errors, err)
 	}
 
 	// Delete the old prefix list.
 	_, err = plafm.ec2.DeleteManagedPrefixList(&ec2.DeleteManagedPrefixListInput{DryRun: aws.Bool(false), PrefixListId: aws.String(existingPrefixListID)})
 	if err != nil {
 		log.Printf("Failed to delete old prefix list %s (%s): %v", existingPrefixListID, prefixListName, err)
-		results = append(results, PrefixListManagementOp{
-			PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpPrefixListDeleteFailedError,
-			ExistingPrefixListID: existingPrefixListID, Error: err,
-		})
+		plafm.errors = append(plafm.errors, err)
 	}
-
-	results = append(results, PrefixListManagementOp{
-		PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpReplacePrefixList,
-		ExistingPrefixListID: existingPrefixListID, NewPrefixListID: newPrefixListID,
-	})
-
-	return results
 }
 
-func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(securityGroup *ec2.SecurityGroup, prefixListName, existingPrefixListID, newPrefixListID string) []PrefixListManagementOp {
+func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(securityGroup *ec2.SecurityGroup, prefixListName, existingPrefixListID, newPrefixListID string) {
 	var revoke []*ec2.IpPermission
 	var authorize []*ec2.IpPermission
-	results := make([]PrefixListManagementOp, 0, 1)
 
 	// Scan ingress for rules applying to this prefix list.
 	for _, ingress := range securityGroup.IpPermissions {
@@ -633,10 +602,7 @@ func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(secu
 		if _, err := plafm.ec2.RevokeSecurityGroupIngress(&input); err != nil {
 			log.Printf("Failed to revoke security groups %s ingress rule for prefix list %s (%s): %v", *securityGroup.GroupId,
 				existingPrefixListID, prefixListName, err)
-			results = append(results, PrefixListManagementOp{
-				PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpSecurityGroupUpdateFailedError,
-				ExistingPrefixListID: existingPrefixListID, SecurityGroupID: *securityGroup.GroupId, Error: err,
-			})
+			plafm.errors = append(plafm.errors, err)
 		} else {
 			input := ec2.AuthorizeSecurityGroupIngressInput{
 				DryRun: aws.Bool(false), GroupId: securityGroup.GroupId, IpPermissions: authorize,
@@ -644,15 +610,7 @@ func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(secu
 			if _, err := plafm.ec2.AuthorizeSecurityGroupIngress(&input); err != nil {
 				log.Printf("Failed to authorize security groups %s ingress rule for prefix list %s (%s): %v", *securityGroup.GroupId,
 					newPrefixListID, prefixListName, err)
-				results = append(results, PrefixListManagementOp{
-					PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpSecurityGroupUpdateFailedError,
-					NewPrefixListID: newPrefixListID, SecurityGroupID: *securityGroup.GroupId, Error: err,
-				})
-			} else {
-				results = append(results, PrefixListManagementOp{
-					PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpUpdateSecurityGroupIngress,
-					ExistingPrefixListID: existingPrefixListID, NewPrefixListID: newPrefixListID, SecurityGroupID: *securityGroup.GroupId,
-				})
+				plafm.errors = append(plafm.errors, err)
 			}
 		}
 	}
@@ -687,10 +645,7 @@ func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(secu
 		if _, err := plafm.ec2.RevokeSecurityGroupEgress(&input); err != nil {
 			log.Printf("Failed to revoke security groups %s egress rule for prefix list %s (%s): %v", *securityGroup.GroupId,
 				existingPrefixListID, prefixListName, err)
-			results = append(results, PrefixListManagementOp{
-				PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpSecurityGroupUpdateFailedError,
-				ExistingPrefixListID: existingPrefixListID, SecurityGroupID: *securityGroup.GroupId, Error: err,
-			})
+			plafm.errors = append(plafm.errors, err)
 		} else {
 			input := ec2.AuthorizeSecurityGroupEgressInput{
 				DryRun: aws.Bool(false), GroupId: securityGroup.GroupId, IpPermissions: authorize,
@@ -698,27 +653,17 @@ func (plafm *PrefixListAddressFamilyManager) replaceSecurityGroupReferences(secu
 			if _, err := plafm.ec2.AuthorizeSecurityGroupEgress(&input); err != nil {
 				log.Printf("Failed to authorize security groups %s egress rule for prefix list %s (%s): %v", *securityGroup.GroupId,
 					newPrefixListID, prefixListName, err)
-				results = append(results, PrefixListManagementOp{
-					PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpSecurityGroupUpdateFailedError,
-					NewPrefixListID: newPrefixListID, SecurityGroupID: *securityGroup.GroupId, Error: err,
-				})
-			} else {
-				results = append(results, PrefixListManagementOp{
-					PrefixListName: prefixListName, AddressFamily: plafm.addressFamily, Operation: OpUpdateSecurityGroupEgress,
-					ExistingPrefixListID: existingPrefixListID, NewPrefixListID: newPrefixListID, SecurityGroupID: *securityGroup.GroupId,
-				})
+				plafm.errors = append(plafm.errors, err)
 			}
 		}
 	}
-
-	return results
 }
 
 // updateSSMWithPrefixListIDs updates the specified SSM parameters with the prefix list ids considered final.
-func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(parameters []string, tags TagMap, tier string) []PrefixListManagementOp {
+func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(parameters []string, tags TagMap, tier string) {
 	// If there are no parameters, there's nothing to do. Short-circuit here so we don't have to keep validating for AWS.
 	if len(parameters) == 0 {
-		return nil
+		return
 	}
 
 	if tier == "" {
@@ -737,12 +682,9 @@ func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(paramete
 	output, err := plafm.ssm.GetParameters(&ssm.GetParametersInput{Names: parameterPtrs, WithDecryption: aws.Bool(false)})
 	if err != nil {
 		log.Printf("Failed to get SSM parameters %v: %v", parameters, err)
-		return []PrefixListManagementOp{{
-			Operation: OpSSMQueryFailedError, AddressFamily: plafm.addressFamily, Error: err,
-		}}
+		plafm.errors = append(plafm.errors, err)
+		return
 	}
-
-	var results []PrefixListManagementOp
 
 	// Keep track of which parameters we've seen -- we'll create ones we haven't seen.
 	unseenParameters := make(map[string]bool)
@@ -762,20 +704,10 @@ func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(paramete
 				Value: &expectedValue, Overwrite: aws.Bool(true)})
 			if err != nil {
 				log.Printf("Failed to update parameter value for %s: %v", *parameter.Name, err)
-				results = append(results, PrefixListManagementOp{
-					AddressFamily: plafm.addressFamily, Operation: OpSSMParameterValueUpdateFailedError,
-					SSMParameterName: *parameter.Name, Error: err,
-				})
-			} else {
-				results = append(results, PrefixListManagementOp{
-					AddressFamily: plafm.addressFamily, Operation: OpSSMParameterValueUpdated, SSMParameterName: *parameter.Name,
-				})
+				plafm.errors = append(plafm.errors, err)
 			}
 		} else {
 			log.Printf("SSM parameter %s value is up-to-date", *parameter.Name)
-			results = append(results, PrefixListManagementOp{
-				AddressFamily: plafm.addressFamily, Operation: OpNoModifySSMParameterValue, SSMParameterName: *parameter.Name,
-			})
 		}
 
 		// And check the tags for this resource
@@ -783,10 +715,7 @@ func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(paramete
 			ResourceId: parameter.Name, ResourceType: aws.String("Parameter")})
 		if err != nil {
 			log.Printf("Failed to get tags for SSM parameter %s: %v", *parameter.Name, err)
-			results = append(results, PrefixListManagementOp{
-				AddressFamily: plafm.addressFamily, Operation: OpSSMQueryFailedError, SSMParameterName: *parameter.Name,
-				Error: err,
-			})
+			plafm.errors = append(plafm.errors, err)
 		} else {
 			tagsNotSeen := make(map[string]string)
 			var tagsToAdd []*ssm.Tag
@@ -823,22 +752,10 @@ func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(paramete
 					ResourceId: parameter.Name, ResourceType: aws.String("Parameter"), Tags: tagsToAdd})
 				if err != nil {
 					log.Printf("Failed to add/update tags for parameter %s: %v", *parameter.Name, err)
-					results = append(results, PrefixListManagementOp{
-						Operation: OpSSMParameterTagsUpdateFailedError, AddressFamily: plafm.addressFamily,
-						SSMParameterName: *parameter.Name, Error: err,
-					})
-				} else {
-					results = append(results, PrefixListManagementOp{
-						Operation: OpSSMParameterTagsUpdated, AddressFamily: plafm.addressFamily, SSMParameterName: *parameter.Name,
-						Error: err,
-					})
+					plafm.errors = append(plafm.errors, err)
 				}
 			} else {
 				log.Printf("SSM parameter %s tags are up-to-date", *parameter.Name)
-				results = append(results, PrefixListManagementOp{
-					Operation: OpNoModifySSMParameterTags, AddressFamily: plafm.addressFamily, SSMParameterName: *parameter.Name,
-					Error: err,
-				})
 			}
 		}
 	}
@@ -858,19 +775,9 @@ func (plafm *PrefixListAddressFamilyManager) updateSSMWithPrefixListIDs(paramete
 
 		if err != nil {
 			log.Printf("Failed to create SSM parameter %s: %v", parameterName, err)
-			results = append(results, PrefixListManagementOp{
-				Operation: OpSSMParameterCreateFailedError, AddressFamily: plafm.addressFamily, SSMParameterName: parameterName,
-				Error: err,
-			})
-		} else {
-			results = append(results, PrefixListManagementOp{
-				Operation: OpSSMParameterCreated, AddressFamily: plafm.addressFamily, SSMParameterName: parameterName,
-				Error: err,
-			})
+			plafm.errors = append(plafm.errors, err)
 		}
 	}
-
-	return results
 }
 
 // AddMetric saves a metric datum to the saved metrics on this object.

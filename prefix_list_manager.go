@@ -165,66 +165,57 @@ func (plm *PrefixListManager) LoadIPRanges() error {
 
 // Process ensures that the managed prefix lists are in-sync with the ip-ranges.json data.
 // LoadIPRanges must be called before invoking this method.
-func (plm *PrefixListManager) Process() ([]PrefixListManagementOp, error) {
+func (plm *PrefixListManager) Process() error {
 	if err := plm.ipv4.filterAndAggregatePrefixes(plm.request.Filters, plm.request.GroupSize); err != nil {
-		return nil, err
+		return err
 	}
 
 	if err := plm.ipv6.filterAndAggregatePrefixes(plm.request.Filters, plm.request.GroupSize); err != nil {
-		return nil, err
+		return err
 	}
 
 	if len(plm.ipv4.keptPrefixes) == 0 && len(plm.ipv6.keptPrefixes) == 0 {
 		log.Printf("Filters returned no prefixes")
-		return nil, fmt.Errorf("Filters returned no prefixes")
+		return fmt.Errorf("Filters returned no prefixes")
 	}
 
 	// Get the prefix list names -- this may fail, so we want to capture any errors before we make modifications to AWS.
 	if err := plm.ipv4.generatePrefixListNames(plm.request.PrefixListNameTemplate); err != nil {
-		return nil, err
+		return err
 	}
 
 	if err := plm.ipv6.generatePrefixListNames(plm.request.PrefixListNameTemplate); err != nil {
-		return nil, err
+		return err
 	}
 
 	// Get the existing managed prefix lists
 	if err := plm.ipv4.mapPrefixListNamesToExistingPrefixLists(); err != nil {
-		return nil, err
+		return err
 	}
 
 	if err := plm.ipv6.mapPrefixListNamesToExistingPrefixLists(); err != nil {
-		return nil, err
+		return err
 	}
 
 	// And perform updates.
-	var ops []PrefixListManagementOp
-	ops = append(ops, plm.ipv4.updateManagedPrefixLists()...)
-	ops = append(ops, plm.ipv6.updateManagedPrefixLists()...)
+	plm.ipv4.updateManagedPrefixLists()
+	plm.ipv6.updateManagedPrefixLists()
 
 	// Copy any results to SSM.
-	ops = append(ops, plm.ipv4.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv4Parameters, plm.request.SSMParameters.Tags,
-		plm.request.SSMParameters.Tier)...)
-	ops = append(ops, plm.ipv6.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv6Parameters, plm.request.SSMParameters.Tags,
-		plm.request.SSMParameters.Tier)...)
+	plm.ipv4.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv4Parameters, plm.request.SSMParameters.Tags,
+		plm.request.SSMParameters.Tier)
+	plm.ipv6.updateSSMWithPrefixListIDs(plm.request.SSMParameters.IPv6Parameters, plm.request.SSMParameters.Tags,
+		plm.request.SSMParameters.Tier)
 
-	// Determine how many operations succeeded
-	nSucceeded := uint(0)
-	for _, op := range ops {
-		if !op.Operation.IsError() {
-			nSucceeded++
-		}
-	}
-
-	plm.writeCloudWatchMetrics(ops, nSucceeded)
+	plm.writeCloudWatchMetrics()
 
 	// Create notifications for SNS
-	plm.notifySNS(ops)
+	plm.notifySNS()
 
-	return ops, nil
+	return nil
 }
 
-func (plm *PrefixListManager) writeCloudWatchMetrics(ops []PrefixListManagementOp, nSucceeded uint) {
+func (plm *PrefixListManager) writeCloudWatchMetrics() {
 	// Skip this if we're not writing metrics (MetricsNamespace is empty)
 	if plm.request.Metrics.Namespace == nil {
 		return
@@ -240,20 +231,26 @@ func (plm *PrefixListManager) writeCloudWatchMetrics(ops []PrefixListManagementO
 		metrics = append(metrics, plm.ipv6.metrics...)
 	}
 
+	// Determine whether the run was successful.
+	success := 1.0
+	if len(plm.ipv4.errors) != 0 || len(plm.ipv6.errors) != 0 {
+		success = 0.0
+	}
+
 	// Add metrics indicating the total number of operations and the number of operations that failed.
 	metrics = append(metrics,
 		&cloudwatch.MetricDatum{
-			MetricName: aws.String(MetricOperationsAttempted),
+			MetricName: aws.String(MetricProcessRuns),
 			Dimensions: []*cloudwatch.Dimension{DimPrefixListNameBase(plm.request.PrefixListNameBase)},
 			Timestamp:  &now,
-			Value:      aws.Float64(float64(len(ops))),
+			Value:      aws.Float64(1.0),
 			Unit:       aws.String(UnitCount),
 		},
 		&cloudwatch.MetricDatum{
-			MetricName: aws.String(MetricOperationsSucceeded),
+			MetricName: aws.String(MetricProcessRunsSuccess),
 			Dimensions: []*cloudwatch.Dimension{DimPrefixListNameBase(plm.request.PrefixListNameBase)},
 			Timestamp:  &now,
-			Value:      aws.Float64(float64(nSucceeded)),
+			Value:      aws.Float64(success),
 			Unit:       aws.String(UnitCount),
 		})
 
@@ -275,6 +272,32 @@ func (plm *PrefixListManager) writeCloudWatchMetrics(ops []PrefixListManagementO
 }
 
 // NotifySNS publishes a notification to SNS from the operations performed.
-func (plm *PrefixListManager) notifySNS(ops []PrefixListManagementOp) {
+func (plm *PrefixListManager) notifySNS() {
+	// Don't notify if we didn't perform updates
+	if !plm.ipv4.updatesPerformed && !plm.ipv6.updatesPerformed {
+		return
+	}
 
+	notification, err := json.Marshal(PrefixListNotification{
+		PrefixListNameBase: plm.request.PrefixListNameBase,
+		IPv4:               &plm.ipv4.notification,
+		IPv6:               &plm.ipv6.notification,
+	})
+
+	if err != nil {
+		log.Printf("Failed to marshal notification structure: %v", err)
+		return
+	}
+
+	notificationStr := string(notification)
+
+	for _, topicARN := range plm.request.SNSTopicARNs {
+		result, err := plm.sns.Publish(
+			&sns.PublishInput{TopicArn: &topicARN, Subject: &plm.request.SNSSubject, Message: &notificationStr})
+		if err != nil {
+			log.Printf("Failed to send notification to %s: %v", topicARN, err)
+		} else {
+			log.Printf("Notification sent to %s (message id: %s)", topicARN, aws.StringValue(result.MessageId))
+		}
+	}
 }

@@ -61,7 +61,6 @@ func main() {
 // HandleLambdaRequest is the main Lambda entrypoint for updating a prefix list from ip-ranges.json.
 func HandleLambdaRequest(ctx context.Context, request ManageAWSPrefixListsRequest) (string, error) {
 	log.Printf("Incoming request: %v", request)
-	var ops []PrefixListManagementOp
 
 	plm, err := NewPrefixListManagerFromRequest(ctx, &request)
 	if err != nil {
@@ -73,13 +72,24 @@ func HandleLambdaRequest(ctx context.Context, request ManageAWSPrefixListsReques
 		return "", err
 	}
 
-	if ops, err = plm.Process(); err != nil {
+	if err = plm.Process(); err != nil {
 		return "", fmt.Errorf("Failed to process ip-ranges.json from %s: %v", request.IPRangesURL, err)
 	}
 
-	response := ManageAWSPrefixListsResponse{
-		Status:     "SUCCESS",
-		Operations: ops,
+	response := ManageAWSPrefixListsResponse{}
+
+	if len(plm.ipv4.errors) != 0 || len(plm.ipv6.errors) != 0 {
+		response.Status = "ERROR"
+
+		for _, err := range plm.ipv4.errors {
+			response.Errors = append(response.Errors, err.Error())
+		}
+
+		for _, err := range plm.ipv6.errors {
+			response.Errors = append(response.Errors, err.Error())
+		}
+	} else {
+		response.Status = "SUCCESS"
 	}
 
 	resultBytes, err := json.Marshal(response)
