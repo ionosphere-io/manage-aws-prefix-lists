@@ -62,7 +62,7 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 
 	plm := new(PrefixListManager)
 
-	awsSession, err := session.NewSession()
+	awsSession, err := session.NewSession(&aws.Config{MaxRetries: aws.Int(int(MaxRetries))})
 	if err != nil {
 		log.Printf("Failed to create an AWS session: %v", err)
 		return nil, err
