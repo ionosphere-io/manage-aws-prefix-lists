@@ -244,7 +244,9 @@ func TestBasicPrefixList(c *testing.T) {
 	defer server.Shutdown()
 
 	ec2Mock := &EC2Mock{}
+	snsMock := &SNSMock{}
 	ctx := context.WithValue(context.Background(), EC2ClientKey, ec2Mock)
+	ctx = context.WithValue(ctx, SNSClientKey, snsMock)
 	ctx = context.WithValue(ctx, SSMClientKey, &SSMMock{})
 	ctx = context.WithValue(ctx, STSClientKey, &STSMock{})
 	req := ManageAWSPrefixListsRequest{}
@@ -252,21 +254,22 @@ func TestBasicPrefixList(c *testing.T) {
 	"PrefixListNameBase": "cloudfront",
 	"Filters": [
 		{"Service": "CLOUDFRONT"}
-	]
+	],
+	"SNSTopicArns": ["arn:aws:sns:us-west-2:123456789012:topic"]
 }`), &req); err != nil {
 		c.Fatalf("Failed to create request: %v", err)
 	}
 
 	req.IPRangesURL = server.GetURL()
 
-	response, error := HandleLambdaRequest(ctx, req)
-	if error != nil {
-		c.Errorf("Failed to handle request: %v\n", error)
+	response, err := HandleLambdaRequest(ctx, req)
+	if err != nil {
+		c.Errorf("Failed to handle request: %v\n", err)
 	}
 	responseDecoded := make(map[string]interface{})
-	error = json.Unmarshal([]byte(response), &responseDecoded)
-	if error != nil {
-		c.Errorf("Failed to unmarshal response as JSON: %v\n", error)
+	err = json.Unmarshal([]byte(response), &responseDecoded)
+	if err != nil {
+		c.Errorf("Failed to unmarshal response as JSON: %v\n", err)
 	}
 
 	// Make sure aggregation happened as expected
@@ -292,6 +295,52 @@ func TestBasicPrefixList(c *testing.T) {
 				if aws.StringValue(mpl.Entries[1].Cidr) != "fc00:22::/62" {
 					c.Errorf("Expected aggregation to result in fc00:22::/62: %v", mpl.Entries[1].Cidr)
 				}
+			}
+		}
+	}
+
+	// Expect an entry for IPv4 and IPv6 in the SNS notification.
+	notifications := snsMock.NotificationsByTopicARN["arn:aws:sns:us-west-2:123456789012:topic"]
+	if len(notifications) != 1 {
+		c.Errorf("Expected 1 notification from SNS; got %d", len(notifications))
+	} else {
+		notification := notifications[0]
+		messageStr := aws.StringValue(notification.Message)
+		message := PrefixListNotification{}
+		if err = json.Unmarshal([]byte(messageStr), &message); err != nil {
+			c.Logf("Message: %s", messageStr)
+			c.Errorf("Failed to unmarshal notification: %v", err)
+		} else {
+			if message.PrefixListNameBase != "cloudfront" {
+				c.Errorf(`Expected PrefixListNameBase to be "cloudfront": %v`, message.PrefixListNameBase)
+			}
+
+			if message.IPv4 == nil {
+				c.Errorf("Expected notification IPv4 to be non-nil")
+			} else if len(message.IPv4.PrefixListIDs) != 1 {
+				c.Errorf("Expected 1 prefix list ID in IPv4 notification: %v", message.IPv4.PrefixListIDs)
+			}
+
+			if len(message.IPv4.UpdatedPrefixListIDs) != 0 {
+				c.Errorf("Expected no IPv4 prefix list updates; got %d", len(message.IPv4.UpdatedPrefixListIDs))
+			}
+
+			if len(message.IPv4.ReplacedPrefixLists) != 0 {
+				c.Errorf("Expected no IPv4 prefix list replacements; got %d", len(message.IPv4.ReplacedPrefixLists))
+			}
+
+			if message.IPv6 == nil {
+				c.Errorf("Expected notification IPv6 to be non-nil")
+			} else if len(message.IPv6.PrefixListIDs) != 1 {
+				c.Errorf("Expected 1 prefix list ID in IPv6 notification: %v", message.IPv6.PrefixListIDs)
+			}
+
+			if len(message.IPv6.UpdatedPrefixListIDs) != 0 {
+				c.Errorf("Expected no IPv6 prefix list updates; got %d", len(message.IPv6.UpdatedPrefixListIDs))
+			}
+
+			if len(message.IPv6.ReplacedPrefixLists) != 0 {
+				c.Errorf("Expected no IPv6 prefix list replacements; got %d", len(message.IPv6.ReplacedPrefixLists))
 			}
 		}
 	}
@@ -360,8 +409,10 @@ func TestIPv4ReplacedRangesIPv4IPv6PrefixList(c *testing.T) {
 	defer server.Shutdown()
 
 	ec2Mock := &EC2Mock{}
+	snsMock := &SNSMock{}
 	ssmMock := &SSMMock{}
 	ctx := context.WithValue(context.Background(), EC2ClientKey, ec2Mock)
+	ctx = context.WithValue(ctx, SNSClientKey, snsMock)
 	ctx = context.WithValue(ctx, SSMClientKey, ssmMock)
 	ctx = context.WithValue(ctx, STSClientKey, &STSMock{})
 	req := ManageAWSPrefixListsRequest{}
@@ -371,6 +422,7 @@ func TestIPv4ReplacedRangesIPv4IPv6PrefixList(c *testing.T) {
 	"Filters": [
 		{"Service": "CLOUDFRONT", "AddressFamily": "IPv4"}
 	],
+	"SNSTopicARNs": ["arn:aws:sns:us-west-2:123456789012:topic"],
 	"SSMParameters": {
 		"IPv4Parameters": ["SSMParamIPv4"],
 		"Tags": {"Service": "Cloudfront"}
@@ -413,6 +465,55 @@ func TestIPv4ReplacedRangesIPv4IPv6PrefixList(c *testing.T) {
 				c.Errorf("Mismatch in case 1 prefixes: %s", msg)
 			}
 		}
+
+		// Make sure SNS has the expected notification
+		notifications := snsMock.NotificationsByTopicARN["arn:aws:sns:us-west-2:123456789012:topic"]
+		if len(notifications) != 1 {
+			c.Errorf("Expected 1 SNS notification; got %d", len(notifications))
+		} else {
+			notification := notifications[0]
+			messageStr := aws.StringValue(notification.Message)
+			message := PrefixListNotification{}
+			if err = json.Unmarshal([]byte(messageStr), &message); err != nil {
+				c.Logf("Message: %s", messageStr)
+				c.Errorf("Failed to unmarshal notification: %v", err)
+			} else {
+				if message.PrefixListNameBase != "cloudfront" {
+					c.Errorf(`Expected PrefixListNameBase to be "cloudfront": %v`, message.PrefixListNameBase)
+				}
+
+				if message.IPv4 == nil {
+					c.Errorf("Expected notification IPv4 to be non-nil")
+				} else if len(message.IPv4.PrefixListIDs) != 1 {
+					c.Errorf("Expected 1 prefix list ID in IPv4 notification: %v", message.IPv4.PrefixListIDs)
+				}
+
+				if len(message.IPv4.UpdatedPrefixListIDs) != 0 {
+					c.Errorf("Expected no IPv4 prefix list updates; got %d", len(message.IPv4.UpdatedPrefixListIDs))
+				}
+
+				if len(message.IPv4.ReplacedPrefixLists) != 0 {
+					c.Errorf("Expected no IPv4 prefix list replacements; got %d", len(message.IPv4.ReplacedPrefixLists))
+				}
+
+				if message.IPv6 == nil {
+					c.Errorf("Expected notification IPv6 to be non-nil")
+				} else if len(message.IPv6.PrefixListIDs) != 0 {
+					c.Errorf("Expected no prefix list ID in IPv6 notification: %v", message.IPv6.PrefixListIDs)
+				}
+
+				if len(message.IPv6.UpdatedPrefixListIDs) != 0 {
+					c.Errorf("Expected no IPv6 prefix list updates; got %d", len(message.IPv6.UpdatedPrefixListIDs))
+				}
+
+				if len(message.IPv6.ReplacedPrefixLists) != 0 {
+					c.Errorf("Expected no IPv6 prefix list replacements; got %d", len(message.IPv6.ReplacedPrefixLists))
+				}
+			}
+		}
+
+		// Clear the notifications
+		snsMock.NotificationsByTopicARN = nil
 
 		// Make sure SSM contains the expected parameters.
 		if len(ssmMock.parameters) != 1 {
@@ -491,6 +592,52 @@ func TestIPv4ReplacedRangesIPv4IPv6PrefixList(c *testing.T) {
 		}
 
 		if ipv4PrefixListID != "" && ipv6PrefixListID != "" {
+			// Make sure SNS contains the expected notification
+			notifications := snsMock.NotificationsByTopicARN["arn:aws:sns:us-west-2:123456789012:topic"]
+			if len(notifications) != 1 {
+				c.Errorf("Expected 1 SNS notificaiton")
+			} else {
+				notification := notifications[0]
+				messageStr := aws.StringValue(notification.Message)
+				message := PrefixListNotification{}
+				if err = json.Unmarshal([]byte(messageStr), &message); err != nil {
+					c.Logf("Message: %s", messageStr)
+					c.Errorf("Failed to unmarshal notification: %v", err)
+				} else {
+					if message.PrefixListNameBase != "cloudfront" {
+						c.Errorf(`Expected PrefixListNameBase to be "cloudfront": %v`, message.PrefixListNameBase)
+					}
+
+					if message.IPv4 == nil {
+						c.Errorf("Expected notification IPv4 to be non-nil")
+					} else if len(message.IPv4.PrefixListIDs) != 1 {
+						c.Errorf("Expected 1 prefix list ID in IPv4 notification: %v", message.IPv4.PrefixListIDs)
+					}
+
+					if len(message.IPv4.UpdatedPrefixListIDs) != 1 {
+						c.Errorf("Expected 1 IPv4 prefix list updates; got %d", len(message.IPv4.UpdatedPrefixListIDs))
+					}
+
+					if len(message.IPv4.ReplacedPrefixLists) != 0 {
+						c.Errorf("Expected no IPv4 prefix list replacements; got %d", len(message.IPv4.ReplacedPrefixLists))
+					}
+
+					if message.IPv6 == nil {
+						c.Errorf("Expected notification IPv6 to be non-nil")
+					} else if len(message.IPv6.PrefixListIDs) != 1 {
+						c.Errorf("Expected 1 prefix list ID in IPv6 notification: %v", message.IPv6.PrefixListIDs)
+					}
+
+					if len(message.IPv6.UpdatedPrefixListIDs) != 0 {
+						c.Errorf("Expected no IPv6 prefix list updates; got %d", len(message.IPv6.UpdatedPrefixListIDs))
+					}
+
+					if len(message.IPv6.ReplacedPrefixLists) != 0 {
+						c.Errorf("Expected no IPv6 prefix list replacements; got %d", len(message.IPv6.ReplacedPrefixLists))
+					}
+				}
+			}
+
 			// Make sure SSM contains the expected parameters.
 			if len(ssmMock.parameters) != 2 {
 				c.Errorf("Expected SSM to contain 2 parameters instead of %d", len(ssmMock.parameters))
@@ -702,9 +849,11 @@ func TestReplaceSecurityGroupRules(c *testing.T) {
 
 	cwMock := &CloudWatchMock{}
 	ec2Mock := &EC2Mock{}
+	snsMock := &SNSMock{}
 	ssmMock := &SSMMock{}
 	ctx := context.WithValue(context.Background(), CloudWatchClientKey, cwMock)
 	ctx = context.WithValue(ctx, EC2ClientKey, ec2Mock)
+	ctx = context.WithValue(ctx, SNSClientKey, snsMock)
 	ctx = context.WithValue(ctx, SSMClientKey, ssmMock)
 	ctx = context.WithValue(ctx, STSClientKey, &STSMock{})
 	req := ManageAWSPrefixListsRequest{}

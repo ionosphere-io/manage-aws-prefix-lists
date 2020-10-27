@@ -11,6 +11,8 @@ import (
 	"github.com/aws/aws-sdk-go/service/cloudwatch/cloudwatchiface"
 	"github.com/aws/aws-sdk-go/service/ec2"
 	"github.com/aws/aws-sdk-go/service/ec2/ec2iface"
+	"github.com/aws/aws-sdk-go/service/sns"
+	"github.com/aws/aws-sdk-go/service/sns/snsiface"
 	"github.com/aws/aws-sdk-go/service/ssm"
 	"github.com/aws/aws-sdk-go/service/ssm/ssmiface"
 	"github.com/aws/aws-sdk-go/service/sts"
@@ -710,6 +712,45 @@ func (m *EC2Mock) revokeSecurityGroupRules(groupID *string, permissions []*ec2.I
 	}
 
 	return nil
+}
+
+type SNSMockMessage struct {
+	MessageID         *string
+	Message           *string
+	MessageAttributes map[string]*sns.MessageAttributeValue
+	MessageStructure  *string
+	Subject           *string
+}
+
+type SNSMock struct {
+	snsiface.SNSAPI
+	NotificationsByTopicARN map[string][]SNSMockMessage
+}
+
+func (m *SNSMock) Publish(input *sns.PublishInput) (*sns.PublishOutput, error) {
+	topicARN := aws.StringValue(input.TopicArn)
+
+	if topicARN == "" {
+		return nil, fmt.Errorf("TopicArn must be specified and not empty.")
+	}
+
+	if input.Message == nil {
+		return nil, fmt.Errorf("Message must be specified.")
+	}
+
+	messageID := fmt.Sprintf("%x", rand.Int())
+
+	message := SNSMockMessage{MessageID: &messageID, Message: CopyAWSString(input.Message),
+		MessageAttributes: input.MessageAttributes, MessageStructure: CopyAWSString(input.MessageStructure),
+		Subject: CopyAWSString(input.Subject),
+	}
+
+	if m.NotificationsByTopicARN == nil {
+		m.NotificationsByTopicARN = make(map[string][]SNSMockMessage)
+	}
+
+	m.NotificationsByTopicARN[topicARN] = append(m.NotificationsByTopicARN[topicARN], message)
+	return &sns.PublishOutput{MessageId: &messageID}, nil
 }
 
 type SSMMock struct {
