@@ -154,6 +154,35 @@ const (
 	UnitMilliseconds string = "Milliseconds"
 )
 
+// Invoke is the union of types allowed by the Lambda function.
+type Invoke struct {
+	// IPRangesUpdated is the structure used when an ip-ranges.json update notification is received.
+	IPRangesUpdated *IPRangesUpdatedRequest
+
+	// ManageRequest is the structure used to actually invoke the ManagePrefixLists function.
+	ManageRequest *ManageAWSPrefixListsRequest
+}
+
+func (inv *Invoke) UnmarshalJSON(data []byte) error {
+	// Try to unmarshal this as a manage request first.
+	manageReq := new(ManageAWSPrefixListsRequest)
+	err1 := json.Unmarshal(data, manageReq)
+	if err1 == nil {
+		inv.ManageRequest = manageReq
+		return nil
+	}
+
+	// Try to unmarshal this as an IPRangesUpdated request
+	iprUpdate := new(IPRangesUpdatedRequest)
+	err2 := json.Unmarshal(data, iprUpdate)
+	if err2 == nil {
+		inv.IPRangesUpdated = iprUpdate
+		return nil
+	}
+
+	return fmt.Errorf("Could not unmarshal Invoke request as ManageAWSPrefixListsRequest (%v) or IPRangesUpdated (%v) structure", err1, err2)
+}
+
 // ManageAWSPrefixListsRequest is the structure an incoming event is expected to adhere to.
 type ManageAWSPrefixListsRequest struct {
 	// PrefixListNameBase is the base name of the prefix lists that will be created. PrefixListNameTemplate is used to generate the
@@ -611,6 +640,34 @@ type PrefixListAddressFamilyNotification struct {
 type PrefixListReplacement struct {
 	OldPrefixListID string `json:"OldPrefixListId"`
 	NewPrefixListID string `json:"NewPrefixListId"`
+}
+
+// IPRangesUpdatedRequest is the outer layer of an SNS notification received by Lambda.
+type IPRangesUpdatedRequest struct {
+	Records []SNSNotificationEvent
+}
+
+// SNSNotification is the structure of an SNS notification received by Lambda.
+type SNSNotificationEvent struct {
+	EventVersion         *string          `json:"EventVersion"`
+	EventSubscriptionArn *string          `json:"EventSubscriptionArn"`
+	EventSource          *string          `json:"EventSource"`
+	SNS                  *SNSNotification `json:"Sns"`
+}
+
+// SNSNotification is the structure of the SNS message received by Lambda.
+type SNSNotification struct {
+	SignatureVersion  *string                `json:"SignatureVersion"`
+	Timestamp         *string                `json:"Timestamp"`
+	Signature         *string                `json:"Signature"`
+	SigningCertURL    *string                `json:"SigningCertUrl"`
+	MessageID         *string                `json:"MessageId"`
+	Message           *string                `json:"Message"`
+	MessageAttributes map[string]interface{} `json:"MessageAttributes"`
+	Type              *string                `json:"Type"`
+	UnsubscribeURL    *string                `json:"UnsubscribeUrl"`
+	TopicARN          *string                `json:"TopicArn"`
+	Subject           *string                `json:"Subject"`
 }
 
 // MetricRecorder is an interface implemented by types that can hold or report metric datums to CloudWatch.

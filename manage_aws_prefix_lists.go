@@ -10,6 +10,9 @@ import (
 	"os"
 
 	"github.com/aws/aws-lambda-go/lambda"
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/eventbridge"
 )
 
 // main program entrypoint. This allows for command-line testing as well as invocation from within Lambda.
@@ -47,7 +50,7 @@ func main() {
 			os.Exit(1)
 		}
 
-		result, err := HandleLambdaRequest(context.Background(), request)
+		result, err := HandleLambdaRequest(context.Background(), Invoke{ManageRequest: &request})
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Request failed: %v\n", err)
 			os.Exit(1)
@@ -59,10 +62,45 @@ func main() {
 }
 
 // HandleLambdaRequest is the main Lambda entrypoint for updating a prefix list from ip-ranges.json.
-func HandleLambdaRequest(ctx context.Context, request ManageAWSPrefixListsRequest) (string, error) {
-	log.Printf("Incoming request: %v", request)
+func HandleLambdaRequest(ctx context.Context, invoke Invoke) (string, error) {
+	log.Printf("Incoming request: %v", invoke)
 
-	plm, err := NewPrefixListManagerFromRequest(ctx, &request)
+	if invoke.IPRangesUpdated != nil {
+		return HandleIPRangesUpdated(ctx, invoke.IPRangesUpdated)
+	}
+
+	if invoke.ManageRequest != nil {
+		return HandleManageRequest(ctx, invoke.ManageRequest)
+	}
+
+	return "", fmt.Errorf("Unable to handle incoming request")
+}
+
+func HandleIPRangesUpdated(ctx context.Context, records *IPRangesUpdatedRequest) (string, error) {
+	awsLogLevel := aws.LogDebugWithRequestRetries | aws.LogDebugWithRequestErrors
+	awsSession, err := session.NewSession(&aws.Config{LogLevel: &awsLogLevel, MaxRetries: aws.Int(int(MaxRetries))})
+	if err != nil {
+		log.Printf("Failed to create an AWS session: %v", err)
+		return "", err
+	}
+	entries := []*eventbridge.PutEventsRequestEntry{{Detail: aws.String("{}"), DetailType: aws.String("IPRanges Update Notification"), Source: aws.String("ManageAWSPrefixLists")}}
+	ebClient := eventbridge.New(awsSession)
+	result, err := ebClient.PutEvents(&eventbridge.PutEventsInput{Entries: entries})
+	if err != nil {
+		log.Printf("Failed to invoke EventBridge rules: %v", err)
+		return "", err
+	}
+
+	if aws.Int64Value(result.FailedEntryCount) != 0 {
+		log.Printf("Failed to invoke EventBridge rules: ErrorCode=%d ErrorMessage=%v", result.Entries[0].ErrorCode, result.Entries[0].ErrorMessage)
+		return "", fmt.Errorf("Failed to invoke EventBridge rules: ErrorCode=%d ErrorMessage=%v", result.Entries[0].ErrorCode, result.Entries[0].ErrorMessage)
+	}
+
+	return `{"Status": "SUCCESS"}`, nil
+}
+
+func HandleManageRequest(ctx context.Context, request *ManageAWSPrefixListsRequest) (string, error) {
+	plm, err := NewPrefixListManagerFromRequest(ctx, request)
 	if err != nil {
 		return "", fmt.Errorf("Failed to create a PrefixListManager app handler: %v", err)
 	}

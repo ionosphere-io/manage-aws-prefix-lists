@@ -262,7 +262,7 @@ func TestBasicPrefixList(c *testing.T) {
 
 	req.IPRangesURL = server.GetURL()
 
-	response, err := HandleLambdaRequest(ctx, req)
+	response, err := HandleLambdaRequest(ctx, Invoke{ManageRequest: &req})
 	if err != nil {
 		c.Errorf("Failed to handle request: %v\n", err)
 	}
@@ -433,7 +433,7 @@ func TestIPv4ReplacedRangesIPv4IPv6PrefixList(c *testing.T) {
 
 	req.IPRangesURL = server.GetURL()
 
-	response, error := HandleLambdaRequest(ctx, req)
+	response, error := HandleLambdaRequest(ctx, Invoke{ManageRequest: &req})
 	if error != nil {
 		c.Errorf("Failed to handle request: %v\n", error)
 		return
@@ -545,7 +545,7 @@ func TestIPv4ReplacedRangesIPv4IPv6PrefixList(c *testing.T) {
 	req.SSMParameters.IPv6Parameters = []string{"SSMParamIPv6"}
 	req.SSMParameters.Tags["Hello"] = "World"
 
-	response, error = HandleLambdaRequest(ctx, req)
+	response, error = HandleLambdaRequest(ctx, Invoke{ManageRequest: &req})
 	if error != nil {
 		c.Errorf("Failed to handle request: %v\n", error)
 		return
@@ -727,7 +727,7 @@ func TestReplacePrefixList(c *testing.T) {
 
 	req.IPRangesURL = server.GetURL()
 
-	response, error := HandleLambdaRequest(ctx, req)
+	response, error := HandleLambdaRequest(ctx, Invoke{ManageRequest: &req})
 	if error != nil {
 		c.Errorf("Failed to handle request: %v\n", error)
 		return
@@ -775,7 +775,7 @@ func TestReplacePrefixList(c *testing.T) {
 	}
 
 	req.GroupSize = 20
-	response, error = HandleLambdaRequest(ctx, req)
+	response, error = HandleLambdaRequest(ctx, Invoke{ManageRequest: &req})
 
 	if error != nil {
 		c.Errorf("Failed to handle request: %v\n", error)
@@ -872,7 +872,7 @@ func TestReplaceSecurityGroupRules(c *testing.T) {
 		c.Fatalf("Failed to create request: %v", err)
 	}
 	req.IPRangesURL = server.GetURL()
-	response, error := HandleLambdaRequest(ctx, req)
+	response, error := HandleLambdaRequest(ctx, Invoke{ManageRequest: &req})
 
 	if error != nil {
 		c.Errorf("Failed to handle request: %v\n", error)
@@ -945,7 +945,7 @@ func TestReplaceSecurityGroupRules(c *testing.T) {
 
 	// Change the prefix list group size
 	req.GroupSize = 20
-	response, error = HandleLambdaRequest(ctx, req)
+	response, error = HandleLambdaRequest(ctx, Invoke{ManageRequest: &req})
 
 	if error != nil {
 		c.Errorf("Failed to handle request: %v\n", error)
