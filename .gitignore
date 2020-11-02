@@ -20,6 +20,12 @@
 *.log
 *.zip
 
-# Generated exectuable
+# Generated exectuables
 manage-aws-prefix-lists
 manage-aws-prefix-lists.exe
+deploy/deploy
+deploy/deploy.exe
+
+# Deployment artifacts
+lambda-*/
+versions.json
