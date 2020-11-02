@@ -76,6 +76,11 @@ cannot query customer-managed prefix lists properly. Here, we assume that the pr
 Manager Parameter Store under the names `/ManagedPrefixLists/CloudFront/IPv4` and `/ManagedPrefixLists/CloudFront/IPv6`.
 
 ```terraform
+variable "region" {
+    type = string
+    description = "The AWS region to deploy to."
+}
+
 variable "aws_vpc_id" {
     type = string
     description = "The VPC to create the security groups in."
@@ -91,6 +96,10 @@ variable "prefix_list_ssm_parameter_ipv4" {
     type = string
     description = "The AWS SSM parameter holding the prefix list IDs for CloudFront's IPv6 ranges."
     default = "/ManagedPrefixLists/CloudFront/IPv6"
+}
+
+provider "aws" {
+    region = var.region
 }
 
 data "aws_ssm_parameter" "prefix_list_ipv4" {
@@ -127,6 +136,21 @@ resource "aws_security_group_rule" "cloudfront_ipv6" {
     from_port = 443
     to_port = 443
     prefix_list_ids = [data.aws.ssm_parameter.prefix_list_ipv6.value[count.index]]
+}
+
+module "managed_prefix_list_core" {
+    source  = "ionosphere-io/managed-prefix-list-core/aws"
+    version = "v0.2.0"
+    region = var.region
+}
+
+module "cloudfront_prefix_list" {
+    source  = "ionosphere-io/managed-prefix-list/aws"
+    version = "v0.2.0"
+    region = var.region
+    lambda_function_arn = module.managed_prefix_list_core.lambda_function_arn
+
+    filter_service = "CLOUDFRONT"
 }
 ```
 
