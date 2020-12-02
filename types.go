@@ -185,6 +185,9 @@ func (inv *Invoke) UnmarshalJSON(data []byte) error {
 
 // ManageAWSPrefixListsRequest is the structure an incoming event is expected to adhere to.
 type ManageAWSPrefixListsRequest struct {
+	// PrefixListRegion is the region in which the prefix list is managed.
+	PrefixListRegion string
+
 	// PrefixListNameBase is the base name of the prefix lists that will be created. PrefixListNameTemplate is used to generate the
 	// full name of the prefix list.
 	PrefixListNameBase string
@@ -241,6 +244,7 @@ type ManageAWSPrefixListsRequest struct {
 }
 
 type manageAWSPrefixListsRequestRaw struct {
+	PrefixListRegion       string             `json:"PrefixListRegion"`
 	PrefixListNameBase     string             `json:"PrefixListNameBase"`
 	PrefixListNameTemplate *string            `json:"PrefixListNameTemplate"`
 	PrefixListTags         TagMap             `json:"PrefixListTags"`
@@ -327,6 +331,7 @@ func (req *ManageAWSPrefixListsRequest) UnmarshalJSON(data []byte) error {
 		}
 	}
 
+	req.PrefixListRegion = raw.PrefixListRegion
 	req.PrefixListNameBase = raw.PrefixListNameBase
 	req.PrefixListNameTemplate = tpl
 	req.PrefixListTags = raw.PrefixListTags
