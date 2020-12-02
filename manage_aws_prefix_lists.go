@@ -18,8 +18,10 @@ import (
 // main program entrypoint. This allows for command-line testing as well as invocation from within Lambda.
 func main() {
 	if os.Getenv("AWS_LAMBDA_FUNCTION_VERSION") != "" {
+		// This branch is invoked in Lambda.
 		lambda.Start(HandleLambdaRequest)
 	} else {
+		// This branch is for command-line testing.
 		var request ManageAWSPrefixListsRequest
 
 		flag.Parse()
@@ -76,6 +78,7 @@ func HandleLambdaRequest(ctx context.Context, invoke Invoke) (string, error) {
 	return "", fmt.Errorf("Unable to handle incoming request")
 }
 
+// HandleIPRangesUpdated handles SNS notifications when ip-ranges.json is updated.
 func HandleIPRangesUpdated(ctx context.Context, records *IPRangesUpdatedRequest) (string, error) {
 	awsLogLevel := aws.LogDebugWithRequestRetries | aws.LogDebugWithRequestErrors
 	awsSession, err := session.NewSession(&aws.Config{LogLevel: &awsLogLevel, MaxRetries: aws.Int(int(MaxRetries))})
@@ -83,8 +86,12 @@ func HandleIPRangesUpdated(ctx context.Context, records *IPRangesUpdatedRequest)
 		log.Printf("Failed to create an AWS session: %v", err)
 		return "", err
 	}
+
+	// Put an event to EventBridge to trigger the rule(s) to update the prefix lists. This will
+	// re-invoke this function with the necessary detail to perform prefix list updates.
 	entries := []*eventbridge.PutEventsRequestEntry{{Detail: aws.String("{}"), DetailType: aws.String("IPRanges Update Notification"), Source: aws.String("ManageAWSPrefixLists")}}
 	ebClient := eventbridge.New(awsSession)
+
 	result, err := ebClient.PutEvents(&eventbridge.PutEventsInput{Entries: entries})
 	if err != nil {
 		log.Printf("Failed to invoke EventBridge rules: %v", err)
@@ -99,21 +106,25 @@ func HandleIPRangesUpdated(ctx context.Context, records *IPRangesUpdatedRequest)
 	return `{"Status": "SUCCESS"}`, nil
 }
 
+// HandleManageRequest handles the core logic of updating a set of prefix lists from ip-ranges.json.
 func HandleManageRequest(ctx context.Context, request *ManageAWSPrefixListsRequest) (string, error) {
 	plm, err := NewPrefixListManagerFromRequest(ctx, request)
 	if err != nil {
 		return "", fmt.Errorf("Failed to create a PrefixListManager app handler: %v", err)
 	}
 
+	// Fetch the ranges from the source document.
 	err = plm.LoadIPRanges()
 	if err != nil {
 		return "", err
 	}
 
+	// Perform the updates and send any update notifications.
 	if err = plm.Process(); err != nil {
 		return "", fmt.Errorf("Failed to process ip-ranges.json from %s: %v", request.IPRangesURL, err)
 	}
 
+	// Create the output response indicating any errors found.
 	response := ManageAWSPrefixListsResponse{}
 
 	if len(plm.ipv4.errors) != 0 || len(plm.ipv6.errors) != 0 {
