@@ -16,7 +16,7 @@
 
 # MacOS, VSCode, log files, generated Lambda ZIP.
 .DS_Store
-.vscode
+.vscode/
 *.log
 *.zip
 

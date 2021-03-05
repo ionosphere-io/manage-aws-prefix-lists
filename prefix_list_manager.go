@@ -41,8 +41,8 @@ type PrefixListManager struct {
 	// ssm is a handle to the AWS SSM ((Simple) Systems Manager) service.
 	ssm ssmiface.SSMAPI
 
-	// sns is a handle to the SNS (Simple Notification Service) service.
-	sns snsiface.SNSAPI
+	// sns is a handle to the SNS (Simple Notification Service) service for various regions.
+	sns map[string]snsiface.SNSAPI
 
 	// request is the incoming request we're handling
 	request *ManageAWSPrefixListsRequest
@@ -63,7 +63,12 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 	plm := new(PrefixListManager)
 	awsLogLevel := aws.LogDebugWithRequestRetries | aws.LogDebugWithRequestErrors
 
-	awsSession, err := session.NewSession(&aws.Config{LogLevel: &awsLogLevel, MaxRetries: aws.Int(int(MaxRetries))})
+	awsConfig := aws.Config{LogLevel: &awsLogLevel, MaxRetries: aws.Int(int(MaxRetries))}
+	if request.PrefixListRegion != "" {
+		awsConfig.Region = &request.PrefixListRegion
+	}
+
+	awsSession, err := session.NewSession(&awsConfig)
 	if err != nil {
 		log.Printf("Failed to create an AWS session: %v", err)
 		return nil, err
@@ -93,14 +98,39 @@ func NewPrefixListManagerFromRequest(ctx context.Context, request *ManageAWSPref
 		stsClient = sts.New(awsSession)
 	}
 
-	if snsClient, present = ctx.Value(SNSClientKey).(snsiface.SNSAPI); !present {
-		snsClient = sns.New(awsSession)
+	// Find all regions we need to send SNS notifications to.
+	snsRegions := make(map[string]bool)
+	for _, snsTopic := range request.SNSTopicARNs {
+		snsARN, err := arn.Parse(snsTopic)
+		if err != nil {
+			log.Printf("Failed to parse SNS topic as a valid ARN: %s: %v", snsTopic, snsARN)
+			return nil, err
+		}
+
+		snsRegions[snsARN.Region] = true
+	}
+
+	plm.sns = make(map[string]snsiface.SNSAPI)
+	if snsClient, present = ctx.Value(SNSClientKey).(snsiface.SNSAPI); present {
+		// Set this to be the SNS client for all SNS topics we're sending to.
+		for region := range snsRegions {
+			plm.sns[region] = snsClient
+		}
+	} else {
+		// Create an SNS client for each region we see in the topic ARNs.
+		for region := range snsRegions {
+			awsSNSSession, err := session.NewSession(&aws.Config{LogLevel: &awsLogLevel, MaxRetries: aws.Int(int(MaxRetries)), Region: &region})
+			if err != nil {
+				log.Printf("Failed to create an AWS session: %v", err)
+				return nil, err
+			}
+			plm.sns[region] = sns.New(awsSNSSession)
+		}
 	}
 
 	plm.cw = cwClient
 	plm.ec2 = ec2Client
 	plm.ssm = ssmClient
-	plm.sns = snsClient
 
 	// Figure out our account id and partition
 	callerID, err := stsClient.GetCallerIdentity(&sts.GetCallerIdentityInput{})
@@ -292,13 +322,16 @@ func (plm *PrefixListManager) notifySNS() {
 
 	notificationStr := string(notification)
 
-	for _, topicARN := range plm.request.SNSTopicARNs {
-		result, err := plm.sns.Publish(
-			&sns.PublishInput{TopicArn: &topicARN, Subject: &plm.request.SNSSubject, Message: &notificationStr})
+	for _, topicARNString := range plm.request.SNSTopicARNs {
+		topicARN, _ := arn.Parse(topicARNString)
+		regionalSNS := plm.sns[topicARN.Region]
+
+		result, err := regionalSNS.Publish(
+			&sns.PublishInput{TopicArn: &topicARNString, Subject: &plm.request.SNSSubject, Message: &notificationStr})
 		if err != nil {
-			log.Printf("Failed to send notification to %s: %v", topicARN, err)
+			log.Printf("Failed to send notification to %s: %v", topicARNString, err)
 		} else {
-			log.Printf("Notification sent to %s (message id: %s)", topicARN, aws.StringValue(result.MessageId))
+			log.Printf("Notification sent to %s (message id: %s)", topicARNString, aws.StringValue(result.MessageId))
 		}
 	}
 }
