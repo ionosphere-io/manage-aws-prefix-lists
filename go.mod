@@ -8,4 +8,7 @@ require (
 	github.com/go-errors/errors v1.4.2
 )
 
-require github.com/jmespath/go-jmespath v0.4.0 // indirect
+require (
+	github.com/jmespath/go-jmespath v0.4.0 // indirect
+	golang.org/x/net v0.7.0 // indirect
+)
