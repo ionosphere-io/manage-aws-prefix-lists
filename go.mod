@@ -4,7 +4,7 @@ go 1.19
 
 require (
 	github.com/aws/aws-lambda-go v1.46.0
-	github.com/aws/aws-sdk-go v1.50.20
+	github.com/aws/aws-sdk-go v1.50.30
 	github.com/go-errors/errors v1.5.1
 )
 
